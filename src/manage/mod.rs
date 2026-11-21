@@ -311,6 +311,14 @@ struct Limits {
     /// restart running, the Reticulum limits) given back to the write limit
     /// in a minute, at most.
     refunds_per_minute: usize,
+    /// Confirms that don't match the change on probation (another user's,
+    /// a wrong id), refused by the node, in a minute in all: past it they are
+    /// turned away before they reach the node, which writes each refusal to
+    /// its audit log.
+    refused_confirms_per_minute: usize,
+    /// Confirms of the change on probation, from its maker, in a minute: a
+    /// bucket of their own, apart from the limits of every other request.
+    matching_confirms_per_minute: usize,
     /// Bad signatures in a minute before requests without a valid one are
     /// refused, and for how long.
     failures: usize,
@@ -338,6 +346,8 @@ impl Default for Limits {
             writes_per_minute: 10,
             confirms_per_minute: 6,
             refunds_per_minute: 60,
+            refused_confirms_per_minute: 120,
+            matching_confirms_per_minute: 30,
             failures: 20,
             lockout: Duration::from_secs(60),
             queue: 8,
@@ -352,6 +362,18 @@ impl Default for Limits {
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
+/// Past the time to confirm a change, how long it can still be on probation
+/// (Reticulum restarting, the checks, a rollback).
+const PROBATION_MARGIN: u64 = 300;
+
+/// A Reticulum change the node accepted: who made it, its id, and when it
+/// can no longer be on probation.
+#[derive(Debug)]
+struct Probation {
+    actor: String,
+    id: String,
+    until: Instant,
+}
 
 /// What the listener remembers between requests.
 #[derive(Debug, Default)]
@@ -365,10 +387,13 @@ struct Guard {
     /// Refunds given, counted apart for writes and confirms, so refused
     /// writes can't use up the confirms' refunds.
     write_refunds: VecDeque<Instant>,
-    /// The confirms each actor had refused in the last minute. Their tokens
-    /// are always given back, so another user's wrong confirms never use up
-    /// the maker's; they are limited for that actor alone instead.
-    refused_confirms: HashMap<String, VecDeque<Instant>>,
+    /// The confirms that matched no change on probation and were refused, in the last minute.
+    refused_confirms: VecDeque<Instant>,
+    /// The change on probation that was last accepted, so its maker's confirm
+    /// is let through every limit (it can only succeed once).
+    probation: Option<Probation>,
+    /// The confirms of that change in the last minute.
+    matching_confirms: VecDeque<Instant>,
     failures: VecDeque<Instant>,
     locked_until: Option<Instant>,
     /// Bad signatures since the last report (log line and audit entry), and
@@ -501,10 +526,10 @@ impl Guard {
     /// Give back the write (or confirm) counted at `at`, which was refused
     /// before anything changed. A write: at most `refunds_per_minute` a
     /// minute, so refusals (which are still audited) can't come at any rate.
-    /// A confirm of `actor`: always, but counted against that actor's refused
-    /// confirms (see [`Guard::confirm_blocked`]), so one user's wrong confirms
-    /// can't use up what another needs.
-    fn refund(&mut self, (kind, at): Counted, actor: &str, now: Instant, limits: &Limits) {
+    /// A confirm: always, but counted in the refused confirms (see
+    /// [`Guard::confirm_blocked`]), so wrong confirms can't use up the tokens
+    /// of the confirm that matters.
+    fn refund(&mut self, (kind, at): Counted, now: Instant, limits: &Limits) {
         match kind {
             Limited::Write => {
                 forget_older(&mut self.write_refunds, now, MINUTE);
@@ -519,40 +544,56 @@ impl Guard {
             Limited::Confirm => {
                 if let Some(index) = self.confirms.iter().position(|taken| *taken == at) {
                     self.confirms.remove(index);
-                    let key = self.refused_key(actor, now);
-                    self.refused_confirms.entry(key).or_default().push_back(now);
+                    self.refused_confirms.push_back(now);
                 }
             }
         }
     }
 
-    /// The most actors whose refused confirms are tracked; the rest share one.
-    const MAX_ACTORS: usize = 256;
-
-    fn refused_key(&mut self, actor: &str, now: Instant) -> String {
-        if !self.refused_confirms.contains_key(actor) && self.refused_confirms.len() >= Self::MAX_ACTORS {
-            self.refused_confirms.retain(|_, refused| {
-                forget_older(refused, now, MINUTE);
-                !refused.is_empty()
-            });
-            if self.refused_confirms.len() >= Self::MAX_ACTORS {
-                return String::new();
-            }
-        }
-        actor.to_string()
-    }
-
-    /// How long `actor` has to wait to send another confirm, if the node
-    /// has refused `refunds_per_minute` of theirs in the last minute. It is
-    /// decided before a token is taken, so it takes nothing from others.
-    fn confirm_blocked(&mut self, actor: &str, now: Instant, limits: &Limits) -> Option<Duration> {
-        let key = if self.refused_confirms.contains_key(actor) { actor } else { "" };
-        let refused = self.refused_confirms.get_mut(key)?;
-        forget_older(refused, now, MINUTE);
-        if refused.len() >= limits.refunds_per_minute {
-            return refused.front().map(|first| MINUTE.saturating_sub(now.saturating_duration_since(*first)));
+    /// How long to wait to send a confirm that matches no change on
+    /// probation, if the node has refused `refused_confirms_per_minute` of
+    /// them in the last minute. Decided before a token is taken.
+    fn confirm_blocked(&mut self, now: Instant, limits: &Limits) -> Option<Duration> {
+        forget_older(&mut self.refused_confirms, now, MINUTE);
+        if self.refused_confirms.len() >= limits.refused_confirms_per_minute {
+            return self.refused_confirms.front().map(|first| MINUTE.saturating_sub(now.saturating_duration_since(*first)));
         }
         None
+    }
+
+    /// Take in the node's answer to a Reticulum change (`confirmed` is
+    /// `None`) or to a confirm of `confirmed`: a change accepted is the one
+    /// on probation until its time is up (its restart and checks, and the
+    /// time to confirm it, and a margin); a confirm that kept it, or that the
+    /// node says no change is waiting for, ends that.
+    fn note_answer(&mut self, actor: &str, confirmed: Option<&str>, reply: &Reply) {
+        match confirmed {
+            None if reply.status == StatusCode::ACCEPTED => {
+                let id = reply.body.get("id").and_then(Value::as_str);
+                let seconds = reply.body.get("confirm_seconds").and_then(Value::as_u64);
+                if let (Some(id), Some(seconds)) = (id, seconds) {
+                    let until = Instant::now() + Duration::from_secs(seconds.min(3600) + PROBATION_MARGIN);
+                    self.probation = Some(Probation { actor: actor.to_string(), id: id.to_string(), until });
+                }
+            }
+            Some(id) => {
+                let gone = reply.status.is_success()
+                    || (reply.body.get("error").and_then(Value::as_str) == Some("not_pending")
+                        && reply.body.get("state").is_some_and(Value::is_null));
+                if gone && self.probation.as_ref().is_some_and(|p| p.id == id) {
+                    self.probation = None;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Whether `id` from `actor` is a confirm of the change on probation.
+    fn confirms_probation(&mut self, actor: &str, id: &str, now: Instant) -> bool {
+        if self.probation.as_ref().is_some_and(|p| now >= p.until) {
+            self.probation = None;
+        }
+        self.probation.as_ref().is_some_and(|p| p.actor == actor && p.id == id)
     }
 }
 
@@ -989,6 +1030,7 @@ fn admit(
     shared: &Shared,
     signed: Option<wire::Signed>,
     limited: Option<Limited>,
+    confirm_id: Option<&str>,
 ) -> Result<(wire::Signed, Option<Counted>), Box<Response>> {
     let now = Instant::now();
     let limits = &shared.limits;
@@ -1066,10 +1108,28 @@ fn admit(
             )));
         }
     }
+    // Whoever made the change on probation, confirming it, is let through the
+    // limits below, as nothing else may keep it from being kept: it has a small
+    // bucket of its own (a refused one, while the node is restarting, uses it too).
+    if limited == Some(Limited::Confirm) && confirm_id.is_some_and(|id| guard.confirms_probation(&signed.actor, id, now)) {
+        forget_older(&mut guard.matching_confirms, now, MINUTE);
+        if guard.matching_confirms.len() >= limits.matching_confirms_per_minute {
+            let wait = guard.matching_confirms.front().map(|first| MINUTE.saturating_sub(now.saturating_duration_since(*first)));
+            let message = "Too many confirms of this change in the last minute: try again shortly";
+            return Err(Box::new(answer(
+                signer,
+                StatusCode::TOO_MANY_REQUESTS,
+                &json!({ "error": "rate_limited", "message": message, "retry_after": seconds(wait.unwrap_or(MINUTE)) }),
+            )));
+        }
+        guard.matching_confirms.push_back(now);
+        drop(guard);
+        return Ok((signed, None));
+    }
     if limited == Some(Limited::Confirm)
-        && let Some(wait) = guard.confirm_blocked(&signed.actor, now, limits)
+        && let Some(wait) = guard.confirm_blocked(now, limits)
     {
-        let message = "This user's confirms were refused too often in the last minute: try again shortly";
+        let message = "The node has refused too many confirms in the last minute: try again shortly";
         return Err(Box::new(answer(
             signer,
             StatusCode::TOO_MANY_REQUESTS,
@@ -1091,6 +1151,12 @@ fn admit(
     }
     drop(guard);
     Ok((signed, limited.map(|kind| (kind, now))))
+}
+
+/// The `id` of a confirm's body, if it has one that is text (the node reads
+/// the body again, strictly).
+fn confirm_id_of(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<Value>(body).ok()?.get("id")?.as_str().map(str::to_string)
 }
 
 /// When a connection's request must be in by, and the flag that says it is
@@ -1136,7 +1202,8 @@ async fn handle(shared: Arc<Shared>, request: Request) -> Response {
     }
     let target = parts.uri.path_and_query().map_or_else(|| parts.uri.path(), |pq| pq.as_str());
     let signed = wire::Signed::parse(&parts.headers).filter(|s| s.verify(&shared.secret, parts.method.as_str(), target, &body));
-    let (signed, counted) = match admit(&shared, signed, route.limited()) {
+    let confirm_id = (route.limited() == Some(Limited::Confirm)).then(|| confirm_id_of(&body)).flatten();
+    let (signed, counted) = match admit(&shared, signed, route.limited(), confirm_id.as_deref()) {
         Ok(admitted) => admitted,
         Err(refused) => return *refused,
     };
@@ -1147,7 +1214,7 @@ async fn handle(shared: Arc<Shared>, request: Request) -> Response {
     // fill it with requests the node turns away.
     let refund = || {
         if let Some(counted) = counted {
-            shared.guard.lock().unwrap_or_else(PoisonError::into_inner).refund(counted, &signed.actor, Instant::now(), &limits);
+            shared.guard.lock().unwrap_or_else(PoisonError::into_inner).refund(counted, Instant::now(), &limits);
         }
     };
     let op = match parse_op(route, parts.uri.query(), &parts.headers, &body) {
@@ -1156,6 +1223,12 @@ async fn handle(shared: Arc<Shared>, request: Request) -> Response {
             refund();
             return error(signer, StatusCode::BAD_REQUEST, "bad_request", message);
         }
+    };
+    // What the answer says of the change on probation (see `Guard::probation`).
+    let watching = match &op {
+        Op::Reticulum { .. } => Some(None),
+        Op::Confirm { id } => Some(Some(id.clone())),
+        _ => None,
     };
     let (reply, answered) = oneshot::channel();
     if shared.jobs.try_send(Job { actor: signed.actor.clone(), op, reply }).is_err() {
@@ -1166,6 +1239,9 @@ async fn handle(shared: Arc<Shared>, request: Request) -> Response {
         Ok(Ok(reply)) => {
             if counted.is_some_and(|(kind, _)| changed_nothing(kind, &reply)) {
                 refund();
+            }
+            if let Some(confirmed) = watching {
+                shared.guard.lock().unwrap_or_else(PoisonError::into_inner).note_answer(&signed.actor, confirmed.as_deref(), &reply);
             }
             answer(signer, reply.status, &reply.body)
         }

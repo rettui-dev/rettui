@@ -115,6 +115,12 @@ enum Owners {
     /// write but a confirm is refused as `pending`, a confirm of alice's is
     /// taken, and another user's is refused.
     Pending(Vec<Op>),
+    /// A stand-in for a node that takes alice's Reticulum change (id
+    /// `0123456789abcdef`), and only alice's confirm of that id.
+    Probation(Vec<Op>),
+    /// The same while Reticulum is still restarting with the change: its
+    /// confirm is refused as not yet on probation.
+    Restarting(Vec<Op>),
 }
 
 struct Harness {
@@ -183,6 +189,29 @@ impl Harness {
                 ops.push(job.op.clone());
                 let _ = job.reply.send(Reply::new(StatusCode::OK, json!({ "op": format!("{:?}", job.op), "actor": job.actor })));
             }
+            Owners::Restarting(ops) => {
+                ops.push(job.op.clone());
+                let reply = match &job.op {
+                    Op::Reticulum { .. } => Reply::new(StatusCode::ACCEPTED, json!({ "id": "0123456789abcdef", "confirm_seconds": 300 })),
+                    _ => Reply::error(StatusCode::CONFLICT, "not_pending", "That change isn't on probation").with("state", "restarting"),
+                };
+                let _ = job.reply.send(reply);
+            }
+            Owners::Probation(ops) => {
+                ops.push(job.op.clone());
+                let reply = match &job.op {
+                    Op::Reticulum { .. } => Reply::new(StatusCode::ACCEPTED, json!({ "id": "0123456789abcdef", "confirm_seconds": 300 })),
+                    Op::Confirm { id } if id == "0123456789abcdef" && job.actor == "alice" => {
+                        Reply::new(StatusCode::OK, json!({ "id": id }))
+                    }
+                    Op::Confirm { id } if id == "0123456789abcdef" => {
+                        Reply::error(StatusCode::FORBIDDEN, "not_allowed", "Only whoever made a change can confirm it")
+                    }
+                    _ => Reply::error(StatusCode::CONFLICT, "not_pending", "No change with that id is waiting to be confirmed")
+                        .with("state", Value::Null),
+                };
+                let _ = job.reply.send(reply);
+            }
             Owners::Pending(ops) => {
                 ops.push(job.op.clone());
                 let reply = match job.op {
@@ -231,13 +260,13 @@ impl Harness {
     fn app(&mut self) -> &mut App {
         match &mut self.owners {
             Owners::Node(node) => &mut node.0,
-            Owners::Echo(_) | Owners::Pending(_) => panic!("no node"),
+            Owners::Echo(_) | Owners::Pending(_) | Owners::Probation(_) | Owners::Restarting(_) => panic!("no node"),
         }
     }
 
     fn ops(&self) -> &[Op] {
         match &self.owners {
-            Owners::Echo(ops) | Owners::Pending(ops) => ops,
+            Owners::Echo(ops) | Owners::Pending(ops) | Owners::Probation(ops) | Owners::Restarting(ops) => ops,
             Owners::Node(..) => panic!("a real node"),
         }
     }
@@ -486,11 +515,11 @@ fn a_lockout_turns_away_unsigned_requests_only() {
         let signing = Signing::get("/manage/v1/state");
         wire::Signed::parse(signing.request().headers())
     };
-    assert_eq!(admit(&shared, None, None).unwrap_err().status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(admit(&shared, None, None).unwrap_err().status(), StatusCode::UNAUTHORIZED, "the one that starts it");
-    assert_eq!(admit(&shared, None, None).unwrap_err().status(), StatusCode::TOO_MANY_REQUESTS);
-    assert!(admit(&shared, signed(), None).is_ok());
-    assert!(admit(&shared, signed(), Some(Limited::Write)).is_ok());
+    assert_eq!(admit(&shared, None, None, None).unwrap_err().status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(admit(&shared, None, None, None).unwrap_err().status(), StatusCode::UNAUTHORIZED, "the one that starts it");
+    assert_eq!(admit(&shared, None, None, None).unwrap_err().status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(admit(&shared, signed(), None, None).is_ok());
+    assert!(admit(&shared, signed(), Some(Limited::Write), None).is_ok());
 }
 
 #[test]
@@ -891,26 +920,63 @@ async fn refused_writes_dont_use_up_the_confirms_refunds() {
     assert_eq!(h.send(&Signing::post("/manage/v1/confirm", &json!({ "id": "0123456789abcdef" }))).await.status, StatusCode::OK);
 }
 
-/// Another user's confirms of a change (wrong actor) are refused, and
-/// given back to the limit: however many are sent, the maker's still goes
-/// through. Past 60 a minute they are turned away for that user alone.
+/// Confirms that match no change on probation (another user's, a wrong id)
+/// can't keep its maker's confirm from going through, however many are sent,
+/// under whatever names; and they are turned away before the node, 120 a
+/// minute in all.
 #[tokio::test]
-async fn another_users_refused_confirms_cant_use_up_the_makers() {
+async fn wrong_confirms_cant_keep_the_makers_from_going_through() {
     let mut h = harness_with("foreign-confirms", Limits::default(), false);
-    h.owners = Owners::Pending(Vec::new());
+    h.owners = Owners::Probation(Vec::new());
+    let change = rns_body(json!(300), json!([{ "path": ["reticulum"], "key": "enable_transport", "value": "yes" }]));
+    assert_eq!(h.send(&Signing::post("/manage/v1/reticulum", &change)).await.status, StatusCode::ACCEPTED);
     let confirm = json!({ "id": "0123456789abcdef" });
-    let mallory = |body: &Value| Signing { actor: "mallory", ..Signing::post("/manage/v1/confirm", body) };
-    for n in 0..66 {
-        let answer = h.send(&mallory(&confirm)).await;
-        let expected = if n < 60 { "not_allowed" } else { "rate_limited" };
-        assert_eq!(answer.code(), expected, "{n}");
+    let wrong = json!({ "id": "fedcba9876543210" });
+    // Another user's confirm of the change: refused, under 100 different names.
+    for n in 0..100 {
+        let actor = format!("user{n}");
+        let answer = h.send(&Signing { actor: &actor, ..Signing::post("/manage/v1/confirm", &confirm) }).await;
+        assert_eq!(answer.code(), "not_allowed", "{n}");
     }
-    // The maker's confirm still goes through, and so do others'.
-    assert_eq!(h.send(&Signing::post("/manage/v1/confirm", &confirm)).await.status, StatusCode::OK);
-    let other = h.send(&Signing { actor: "bob", ..Signing::post("/manage/v1/confirm", &confirm) }).await;
-    assert_eq!(other.code(), "not_allowed");
-    // The turned-away ones never reached the node.
-    assert_eq!(h.ops().len(), 60 + 1 + 1);
+    // The maker's own wrong ids count with them: 20 more fill the 120.
+    for n in 0..30 {
+        let answer = h.send(&Signing::post("/manage/v1/confirm", &wrong)).await;
+        assert_eq!(answer.code(), if n < 20 { "not_pending" } else { "rate_limited" }, "{n}");
+    }
+    // The node saw only those that weren't turned away, and the maker's confirm of its change goes through.
+    assert_eq!(h.ops().len(), 1 + 120);
+    let kept = h.send(&Signing::post("/manage/v1/confirm", &confirm)).await;
+    assert_eq!(kept.status, StatusCode::OK, "{kept:?}");
+    // Once it is kept, a confirm of it is a wrong one like any other.
+    assert_eq!(h.send(&Signing::post("/manage/v1/confirm", &confirm)).await.code(), "rate_limited");
+}
+
+/// The maker's confirms have a small bucket of their own: a flood of them
+/// (signed as the maker, while the node refuses on state) is turned away
+/// before the node, without touching the limits of other confirms.
+#[tokio::test]
+async fn the_makers_confirms_have_a_bucket_of_their_own() {
+    let mut h = harness_with("maker-bucket", Limits::default(), false);
+    h.owners = Owners::Restarting(Vec::new());
+    let change = rns_body(json!(300), json!([{ "path": ["reticulum"], "key": "enable_transport", "value": "yes" }]));
+    assert_eq!(h.send(&Signing::post("/manage/v1/reticulum", &change)).await.status, StatusCode::ACCEPTED);
+    let confirm = json!({ "id": "0123456789abcdef" });
+    // Another user's confirms of the id are no match (and are counted apart).
+    for n in 0..10 {
+        let answer = h.send(&Signing { actor: "mallory", ..Signing::post("/manage/v1/confirm", &confirm) }).await;
+        assert_eq!(answer.code(), "not_pending", "{n}");
+    }
+    // The maker's own confirms: 30 a minute reach the node, and the 31st is turned away before it.
+    let before = h.ops().len();
+    for n in 0..40 {
+        let answer = h.send(&Signing::post("/manage/v1/confirm", &confirm)).await;
+        if n < 30 {
+            assert_eq!(answer.code(), "not_pending", "{n}");
+        } else {
+            assert_eq!(answer.code(), "rate_limited", "{n}");
+        }
+    }
+    assert_eq!(h.ops().len() - before, 30);
 }
 
 #[test]
@@ -1602,7 +1668,7 @@ async fn bad_signatures_owed_when_a_flood_stops_are_reported_with_their_real_cou
     let (jobs, mut received) = mpsc::channel(limits.queue);
     let shared = Shared::new(secret(), jobs, limits, started(), None);
     for _ in 0..10 {
-        let _ = admit(&shared, None, None);
+        let _ = admit(&shared, None, None, None);
     }
     let first = received.try_recv().expect("the lockout is reported when it starts");
     assert_eq!(first.op, Op::AuthFailures { count: 3 });

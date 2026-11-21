@@ -463,7 +463,7 @@ async fn run(cli: Cli) -> Result<()> {
     // put back a Reticulum change the first still has on probation, and the
     // commands that write there would race with a running one. (Reading ones,
     // such as a backup, don't need it.)
-    let _instance = if uses_data_directory(&cli) { Some(instance_lock::InstanceLock::take(&paths.root)?) } else { None };
+    let instance = if uses_data_directory(&cli) { Some(instance_lock::InstanceLock::take(&paths.root)?) } else { None };
     // Before anything is loaded (and, in a new data directory, made).
     match &cli.command {
         Some(Command::Backup { file, with_files, without_identity, passphrase, key, no_passphrase }) => {
@@ -514,6 +514,14 @@ async fn run(cli: Cli) -> Result<()> {
 
     if let Some(limit) = open_files {
         tracing::debug!(limit, "raised the open-file limit");
+    }
+    // Said now, as the log wasn't set up when the lock was taken.
+    if let Some(warning) = instance.as_ref().and_then(instance_lock::InstanceLock::warning) {
+        tracing::warn!("{warning}");
+        config::note_at_start(format!("warning: {warning}"));
+        if cli.web.is_some() || matches!(cli.command, Some(Command::Node(_))) {
+            eprintln!("warning: {warning}");
+        }
     }
     let identity = config::load_identity(&paths.identity)?;
     settle_name(&mut settings, &paths, &identity);

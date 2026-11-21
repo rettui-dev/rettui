@@ -17,6 +17,9 @@ const FILE: &str = "rettui.lock";
 pub struct InstanceLock {
     /// `None` where the file system takes no locks.
     _file: Option<File>,
+    /// Why there is no lock, to say once the log is set up (it isn't yet when
+    /// the lock is taken).
+    warning: Option<String>,
 }
 
 /// Whether `e` says the file system can't lock files at all (as opposed to
@@ -42,21 +45,29 @@ impl InstanceLock {
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
         let file = options.open(&path).with_context(|| format!("opening {}", path.display()))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: Some(file) }),
+            Ok(()) => Ok(Self { _file: Some(file), warning: None }),
             Err(TryLockError::WouldBlock) => bail!(
                 "Another rettui is using the data directory {}. Stop it first, or give this one its own with --data-dir.",
                 root.display()
             ),
-            Err(TryLockError::Error(e)) if no_locks_here(&e) => {
-                tracing::warn!(
-                    "{} can't be locked ({e}), so rettui can't tell whether another one uses {}",
-                    path.display(),
-                    root.display()
-                );
-                Ok(Self { _file: None })
-            }
+            Err(TryLockError::Error(e)) if no_locks_here(&e) => Ok(Self::unlocked(&path, root, &e)),
             Err(TryLockError::Error(e)) => Err(e).with_context(|| format!("locking {}", path.display())),
         }
+    }
+
+    /// A lock that couldn't be had because `e` says the file system takes none.
+    fn unlocked(path: &Path, root: &Path, e: &std::io::Error) -> Self {
+        let warning = format!(
+            "{} can't be locked ({e}), so rettui can't tell whether another one uses {}: don't run two on it",
+            path.display(),
+            root.display()
+        );
+        Self { _file: None, warning: Some(warning) }
+    }
+
+    /// What to say of the lock, if it couldn't be taken.
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
     }
 }
 
@@ -103,6 +114,12 @@ mod tests {
         // Other failures, and a lock held, aren't that.
         assert!(!no_locks_here(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
         assert!(!no_locks_here(&std::io::Error::from(std::io::ErrorKind::WouldBlock)));
+        // The warning is kept for after the log is set up, and a real lock has none.
+        let lock = InstanceLock::unlocked(Path::new("/data/rettui.lock"), Path::new("/data"), &unsupported);
+        assert!(lock.warning().unwrap().contains("/data/rettui.lock") && lock.warning().unwrap().contains("don't run two"));
+        let dir = temp("warning");
+        assert!(InstanceLock::take(&dir).unwrap().warning().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

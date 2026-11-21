@@ -67,6 +67,8 @@ const MAX_HOLD: Duration = Duration::from_secs(120);
 /// How many connections a Backbone listener may refuse, one after the other,
 /// before the probe takes it as having blocked this address.
 const MAX_REFUSED: usize = 5;
+/// How long a new connection is watched for a close, before the first request.
+const EARLY: Duration = Duration::from_millis(200);
 /// The most connections one probe opens: a Backbone listener blocks an
 /// address that connects and leaves too often.
 const MAX_CONNECTIONS: usize = 3;
@@ -586,26 +588,53 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
             break;
         }
         // Refused (not listening yet, or not at all): tried again until the time is up.
-        let Some(mut stream) = connect(dial, left.min(attempt)).await else {
-            refused += 1;
-            if dial.backbone && refused >= MAX_REFUSED {
-                break;
+        let mut stream = match connect(dial, left.min(attempt)).await {
+            Ok(stream) => stream,
+            Err(kind) => {
+                // Only a refusal says the listener turned us away: an address
+                // that drops packets, or any other trouble, is a failure.
+                if kind == std::io::ErrorKind::ConnectionRefused {
+                    refused += 1;
+                } else {
+                    other = true;
+                }
+                if dial.backbone && refused >= MAX_REFUSED {
+                    break;
+                }
+                tokio::time::sleep(left.min(Duration::from_secs(1))).await;
+                continue;
             }
-            tokio::time::sleep(left.min(Duration::from_secs(1))).await;
-            continue;
         };
         connections += 1;
         let opened = tokio::time::Instant::now();
         let mut deframer = Deframer::new(dial.kiss);
         let mut read = 0usize;
         let mut buffer = vec![0u8; 16 * 1024];
-        // Whatever is already waiting was sent before any request of ours: not an answer.
-        while let Ok(n @ 1..) = stream.try_read(&mut buffer) {
-            read += n;
-            let _ = deframer.feed(&buffer[..n]);
-            if read > MAX_READ {
-                break;
+        // Whatever the listener sends before any request of ours is not an
+        // answer. One that closes before a request, without a word, is
+        // turning this address away (a Backbone listener that blocked it as
+        // flapping does); one that closes after a request has taken it in.
+        let early_close = loop {
+            match tokio::time::timeout(EARLY, stream.read(&mut buffer)).await {
+                Err(_) => break false,
+                Ok(Ok(0) | Err(_)) => break true,
+                Ok(Ok(n)) => {
+                    read += n;
+                    let _ = deframer.feed(&buffer[..n]);
+                    if read > MAX_READ {
+                        other = true;
+                        break false;
+                    }
+                }
             }
+        };
+        if early_close {
+            if read == 0 {
+                closed_empty += 1;
+            } else {
+                other = true;
+            }
+            continue;
         }
         // The second the first request of this connection went out.
         let mut sent: Option<u64> = None;
@@ -659,9 +688,8 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
                 }
             };
             if closed {
-                if read == 0 {
-                    closed_empty += 1;
-                }
+                // Closed after it had the request: not a refusal.
+                other = true;
                 break;
             }
         }
@@ -682,11 +710,15 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
     }
 }
 
-/// A connection to the listener, within `wait`.
-async fn connect(dial: &Dial, wait: Duration) -> Option<TcpStream> {
-    let stream = tokio::time::timeout(wait, TcpStream::connect(dial.address)).await.ok()?.ok()?;
+/// A connection to the listener, within `wait`; the kind of error if there
+/// is none (a timeout is `TimedOut`).
+async fn connect(dial: &Dial, wait: Duration) -> Result<TcpStream, std::io::ErrorKind> {
+    let stream = tokio::time::timeout(wait, TcpStream::connect(dial.address))
+        .await
+        .map_err(|_| std::io::ErrorKind::TimedOut)?
+        .map_err(|e| e.kind())?;
     let _ = stream.set_nodelay(true);
-    Some(stream)
+    Ok(stream)
 }
 
 /// A path request, with IFAC and in the interface's framing; `None` if its
@@ -1071,6 +1103,29 @@ mod tests {
                 }
             });
             assert_eq!(probed_as(&dial(silent_at, true), [9; 16], Duration::from_secs(3)).await, Probed::Failed);
+            // One that closes only after it has the request isn't turning us away: the request did something.
+            let late = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let late_at = late.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = late.accept().await {
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    drop(socket);
+                }
+            });
+            assert_eq!(probed_as(&dial(late_at, true), [9; 16], Duration::from_secs(5)).await, Probed::Failed);
+            // An address that drops packets (here: a listener with a full backlog) is a failure,
+            // not a refusal.
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            let full_at = socket.local_addr().unwrap();
+            let _full = socket.listen(0).unwrap();
+            let mut waiting = Vec::new();
+            for _ in 0..4 {
+                waiting.push(tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(full_at)).await);
+            }
+            assert!(waiting.iter().any(Result::is_err), "the backlog is full: some connect hangs");
+            assert_eq!(probed_as(&dial(full_at, true), [9; 16], Duration::from_secs(5)).await, Probed::Failed);
             // One that sends junk and closes isn't either.
             let junk = fake_listener(|_| vec![0x7e, 1, 2, 3, 0x7e]).await;
             assert_eq!(probed_as(&dial(junk, true), [9; 16], Duration::from_secs(3)).await, Probed::Failed);

@@ -1021,11 +1021,12 @@ changes a minute are taken; a change the node turns away before anything
 changed (another change pending, a restart running, a rate limit) or a
 request it can't read doesn't count (up to 60 a minute), so another website
 user can't use up the limit with them. A confirm has a limit of its own, 6 a
-minute, and a refused one doesn't count either: it is given back whoever
-sends it (another user's confirm, or one for no pending change), and counted
-against that user alone, who is turned away after 60 refused confirms a
-minute, so nobody else can keep a change from being confirmed (which would
-roll it back). After 20 requests with a bad signature in a
+minute, and a refused one doesn't count either: it is given back. The
+confirm of the change on probation, from the user who made it, with its id,
+goes through these limits (it has a small one of its own, 30 a minute), so nobody can keep a change from
+being confirmed (which would roll it back). Confirms that match no change
+(another user's, a wrong id) are turned away before they reach the node once
+120 of them were refused in a minute. After 20 requests with a bad signature in a
 minute, requests without a valid signature are refused for a minute (and the
 refusals still count, so a flood keeps it going); requests the website signs
 are still answered. The lockout is logged and added to the audit log when it
