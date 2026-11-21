@@ -724,7 +724,7 @@ the terminal and web UIs have no part in it.
 IPv6 one (`fe80::/10`). `0.0.0.0` and `::` (every address, as Docker needs)
 are allowed, with a warning. Any other address is refused at start
 ("refuses a public address"): put the node behind a private network
-(WireGuard, Tailscale) instead. An address that can't be used stops the node
+(WireGuard) instead. An address that can't be used stops the node
 at start, as a stats address does.
 
 **Only the website may reach the port: this is required, not a
