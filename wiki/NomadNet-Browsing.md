@@ -69,6 +69,11 @@ network.
   marked, and `Enter` (or `↓`) goes to the next, `↑` (or `Shift+Enter` in
   the web UI) the one before, with how many there are; `Esc` is done.
 - **History:** `b` (or a right-click) goes back.
+- **Home page of a node:** `h` (or **⌂** in the web UI, next to the back
+  arrow) opens the front page of the node whose page you are on, and `b`
+  goes back to where you were. It does nothing when no page is open or you
+  are already on the front page. `H` is different: it opens your own `home`
+  setting.
 - **Tabs:** several pages open at once, each with its own history. A saved
   page or node picked from the list (a click or `Enter`) opens in a new tab,
   unless the tab shown is empty, which takes it, or a tab is already on that

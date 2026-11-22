@@ -99,7 +99,8 @@ rettui web UI: http://127.0.0.1:8740/?token=…
   one other devices reach (use the host's).
 - **Browsing:** NomadNet pages are rendered to HTML by rettui, with links and
   forms handled by the web UI and no scripts allowed. `/file/` links download
-  through the browser.
+  through the browser. **⌂** (or `h`), next to the back arrow, opens the front
+  page of the node you are on. See [NomadNet Browsing](NomadNet-Browsing).
 - **Slow links:** live updates stay light, so the web UI is usable over a
   slow or distant connection:
   - **Only what changed:** the interface counters, which change every few

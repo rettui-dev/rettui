@@ -573,6 +573,7 @@ pub fn keys(app: &App) -> Keys {
                 ("a", "keep repositories"),
                 ("u", "source"),
                 ("I", "identify"),
+                ("h", "node home"),
                 ("H", "home"),
                 ("T", "link in new tab"),
                 ("W", "close tab"),

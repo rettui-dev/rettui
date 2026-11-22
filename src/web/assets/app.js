@@ -6587,6 +6587,7 @@ app.views.browser = {
     });
     this.buttons = {
       back: el('button', { text: '←', title: 'Back', onclick: () => this.back() }),
+      home: el('button', { text: '⌂', title: 'This node\'s home page  ( h )', 'aria-label': 'This node\'s home page', onclick: () => this.home() }),
       reload: el('button', { text: '⟳', title: 'Refresh from the network', onclick: () => this.page && this.go(this.page.url, { refresh: true, record: false }) }),
       save: el('button', { text: '☆ Save', onclick: () => this.toggleSaved() }),
       identify: el('button', { text: 'Identify', title: 'Identify to this node', onclick: () => this.toggleIdentify() }),
@@ -6632,7 +6633,7 @@ app.views.browser = {
           this.address.focus();
         } }), this.search), this.paneList),
       el('section', { class: 'panel grow pane-main' }, this.tabStrip,
-        el('div', { class: 'toolbar' }, this.buttons.back, this.address, el('button', { class: 'primary', text: 'Go', onclick: () => this.go(this.address.value) }),
+        el('div', { class: 'toolbar' }, this.buttons.back, this.buttons.home, this.address, el('button', { class: 'primary', text: 'Go', onclick: () => this.go(this.address.value) }),
           tools,
           // On a phone the page's buttons wait behind ⋯.
           el('button', { class: 'phone-only', text: '⋯', title: 'More', 'aria-label': 'More actions', onclick: (e) => {
@@ -6739,6 +6740,7 @@ app.views.browser = {
     const page = this.page;
     for (const name of ['reload', 'save', 'identify', 'source', 'repos']) this.buttons[name].disabled = !page;
     this.buttons.back.disabled = !this.history.length;
+    this.buttons.home.disabled = !this.nodeHome();
     this.buttons.save.textContent = page?.saved ? '★ Saved' : '☆ Save';
     this.buttons.save.classList.toggle('on', !!page?.saved);
     this.buttons.identify.classList.toggle('on', !!page?.identified);
@@ -7068,6 +7070,21 @@ app.views.browser = {
     this.renderPane();
     // A link's `anchor=name`: where on the page to show.
     if (fields?.var_anchor && !this.error) this.jumpTo(fields.var_anchor);
+  },
+
+  // The front page of the node whose page is shown, or null with no page or
+  // when that is the page shown.
+  nodeHome() {
+    const url = this.page?.url;
+    const colon = url ? url.indexOf(':') : -1;
+    if (colon < 0) return null;
+    const home = `${url.slice(0, colon)}:/page/index.mu`;
+    return home === url ? null : home;
+  },
+
+  home() {
+    const home = this.nodeHome();
+    if (home) this.go(home);
   },
 
   back() {
@@ -10545,7 +10562,7 @@ const KEYS = [
     ['Alt+B / I / U, or Ctrl+B / I / U', 'bold, italic or underline the selection, in the message box'],
     ['Alt+F / G', 'text or background colour'], ['Alt+N', 'remove the formatting from the selection']]],
   ['Network', [['/', 'search by name or address'], ['a', 'announces as they\'re heard, or the list']]],
-  ['Browser', [['f', 'find in the page (Enter next, Shift+Enter previous)'], ['b', 'back'], ['g', 'go to an address'],
+  ['Browser', [['f', 'find in the page (Enter next, Shift+Enter previous)'], ['b', 'back'], ['h', 'the front page of this node'], ['g', 'go to an address'],
     ['/', 'search the nodes and saved pages'], ['T', 'a new tab (Ctrl+click or middle-click a link for one)'], ['W', 'close the tab'],
     ['[ ]', 'previous or next tab']]],
   ['Repos', [['n', 'add a repository'], ['r', 'ask the open one\'s node again'], ['m', 'copy it to this computer, or update the copy']]],
@@ -10577,6 +10594,7 @@ document.addEventListener('keydown', (e) => {
     setPane(app.views.browser, 'detail');
     app.views.browser.openFind();
   } else if (e.key === 'b' && app.tab === 'browser') app.views.browser.back();
+  else if (e.key === 'h' && app.tab === 'browser') app.views.browser.home();
   else if (e.key === 'T' && app.tab === 'browser') app.views.browser.newTab();
   else if (e.key === 'W' && app.tab === 'browser') app.views.browser.closeTab();
   else if ((e.key === '[' || e.key === ']') && app.tab === 'browser') app.views.browser.stepTab(e.key === ']' ? 1 : -1);

@@ -1906,6 +1906,31 @@ fn the_browser_by_mouse() {
 }
 
 #[test]
+fn h_opens_the_front_page_of_the_node_and_back_returns() {
+    let mut tui = Tui::new("browser-node-home");
+    let pages = tui.dir.join("node/pages");
+    std::fs::create_dir_all(pages.join("blog")).unwrap();
+    std::fs::write(pages.join("index.mu"), ">Front page\n").unwrap();
+    std::fs::write(pages.join("blog/post.mu"), ">Deep post\n").unwrap();
+    let node = hex::encode(tui.app.node.hash);
+    tui.tab(Tab::Browser);
+    // Nothing open: nothing happens.
+    tui.key(KeyCode::Char('h'));
+    assert!(tui.app.browser.tab.location.is_none());
+    tui.app.open_address(&format!("{node}:/page/blog/post.mu"));
+    assert!(tui.draw().contains("Deep post"));
+    tui.key(KeyCode::Char('h'));
+    let shown = tui.draw();
+    assert!(shown.contains("Front page") && !shown.contains("Deep post"), "{shown}");
+    // On the front page already: no new history entry.
+    let history = tui.app.browser.tab.history.len();
+    tui.key(KeyCode::Char('h'));
+    assert_eq!(tui.app.browser.tab.history.len(), history);
+    tui.key(KeyCode::Char('b'));
+    assert!(tui.draw().contains("Deep post"));
+}
+
+#[test]
 fn browser_tabs_open_and_close_by_mouse() {
     let mut tui = Tui::new("browser-tabs-mouse");
     let pages = tui.dir.join("node/pages");

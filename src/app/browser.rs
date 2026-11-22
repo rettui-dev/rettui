@@ -1028,6 +1028,7 @@ impl App {
                 }
                 return;
             }
+            KeyCode::Char('h') => return self.open_node_index(),
             KeyCode::Char('I') => return self.toggle_identify(),
             KeyCode::Backspace | KeyCode::Char('b') => return self.back(),
             KeyCode::Char('r') => return self.reload(),
@@ -1142,6 +1143,18 @@ impl App {
     fn open_goto(&mut self) {
         let current = self.browser.tab.location.as_ref().map(Location::url).unwrap_or_default();
         self.open_prompt(PromptKind::GoTo, "Go to (hash:/page/path.mu)", &current);
+    }
+
+    /// Open the index page of the node whose page is shown. Back returns.
+    pub fn open_node_index(&mut self) {
+        let Some(node) = self.browser.tab.location.as_ref().map(|at| at.node) else {
+            return;
+        };
+        let on_index =
+            self.browser.tab.location.as_ref().is_some_and(|at| at.path == crate::nomad::paths::INDEX_PATH && at.fields.is_empty());
+        if !on_index {
+            self.navigate(Location { node, path: crate::nomad::paths::INDEX_PATH.to_string(), fields: Default::default() });
+        }
     }
 
     pub(super) fn back(&mut self) {
