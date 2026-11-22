@@ -225,7 +225,11 @@ jobs:
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
-      options: --privileged
+      # The volume keeps flatpak's runtimes off the container's overlay
+      # filesystem. When Flathub has a newer runtime than the image, the
+      # update hardlinks files, which fails there with "Invalid
+      # cross-device link" and then crashes flatpak-builder.
+      options: --privileged -v /var/lib/flatpak
     strategy:
       fail-fast: false
       matrix:
