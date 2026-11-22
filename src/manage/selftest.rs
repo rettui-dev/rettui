@@ -567,6 +567,47 @@ impl Deframer {
     }
 }
 
+/// What the connections of a probe came to, apart from an answer.
+#[derive(Debug, Default)]
+struct Tally {
+    /// Connections made.
+    connections: usize,
+    /// Connects the listener refused outright.
+    refused: usize,
+    /// Connections closed without a word, before a request or when it was sent.
+    closed_empty: usize,
+    /// Anything else: a connect that timed out or failed otherwise, a
+    /// connection that said something or was closed after a request, or one
+    /// still open when the time was up.
+    other: bool,
+}
+
+impl Tally {
+    /// A connect that failed with `kind`. Only a refusal says the listener
+    /// turned us away: an address that drops packets (a timeout), or any
+    /// other trouble, is a failure.
+    fn connect_failed(&mut self, kind: std::io::ErrorKind) {
+        if kind == std::io::ErrorKind::ConnectionRefused {
+            self.refused += 1;
+        } else {
+            self.other = true;
+        }
+    }
+
+    /// How the probe ended, given whether an answer came and whether the
+    /// listener is a Backbone one: only that one is called `Refused`, and
+    /// only if every attempt was a refusal or a connection closed without a word.
+    fn verdict(&self, passed: bool, backbone: bool) -> Probed {
+        if passed {
+            Probed::Passed
+        } else if backbone && !self.other && self.closed_empty == self.connections && self.connections + self.refused > 0 {
+            Probed::Refused
+        } else {
+            Probed::Failed
+        }
+    }
+}
+
 /// Dial `dial` and ask for a path to `destination` until an announce of it
 /// comes back (`Probed::Passed`) or `within` is over (`Probed::Failed`), with
 /// a new request every `attempt` and at most [`MAX_CONNECTIONS`] connections.
@@ -580,9 +621,8 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
     let until = tokio::time::Instant::now() + within;
     let mut held: Option<(TcpStream, tokio::time::Instant)> = None;
     let mut passed = false;
-    let mut connections = 0;
-    let (mut refused, mut closed_empty, mut other) = (0usize, 0usize, false);
-    'connections: while connections < MAX_CONNECTIONS {
+    let mut tally = Tally::default();
+    'connections: while tally.connections < MAX_CONNECTIONS {
         let left = until.saturating_duration_since(tokio::time::Instant::now());
         if left.is_zero() {
             break;
@@ -591,21 +631,15 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
         let mut stream = match connect(dial, left.min(attempt)).await {
             Ok(stream) => stream,
             Err(kind) => {
-                // Only a refusal says the listener turned us away: an address
-                // that drops packets, or any other trouble, is a failure.
-                if kind == std::io::ErrorKind::ConnectionRefused {
-                    refused += 1;
-                } else {
-                    other = true;
-                }
-                if dial.backbone && refused >= MAX_REFUSED {
+                tally.connect_failed(kind);
+                if dial.backbone && tally.refused >= MAX_REFUSED {
                     break;
                 }
                 tokio::time::sleep(left.min(Duration::from_secs(1))).await;
                 continue;
             }
         };
-        connections += 1;
+        tally.connections += 1;
         let opened = tokio::time::Instant::now();
         let mut deframer = Deframer::new(dial.kiss);
         let mut read = 0usize;
@@ -622,7 +656,7 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
                     read += n;
                     let _ = deframer.feed(&buffer[..n]);
                     if read > MAX_READ {
-                        other = true;
+                        tally.other = true;
                         break false;
                     }
                 }
@@ -630,9 +664,9 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
         };
         if early_close {
             if read == 0 {
-                closed_empty += 1;
+                tally.closed_empty += 1;
             } else {
-                other = true;
+                tally.other = true;
             }
             continue;
         }
@@ -641,7 +675,7 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
         loop {
             let now = tokio::time::Instant::now();
             if now >= until {
-                other = true;
+                tally.other = true;
                 held = Some((stream, opened));
                 break 'connections;
             }
@@ -652,7 +686,7 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
             if let Some(request) = framed_request(dial, destination, now.into_std() + STAMP_WITHIN.min(until - now)).await {
                 let at = unix_now();
                 if stream.write_all(&request).await.is_err() {
-                    closed_empty += usize::from(read == 0);
+                    tally.closed_empty += usize::from(read == 0);
                     break;
                 }
                 sent.get_or_insert(at);
@@ -660,14 +694,14 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
             let closed = loop {
                 let bytes = match tokio::time::timeout_at(answer_by, stream.read(&mut buffer)).await {
                     Err(_) => {
-                        other = true;
+                        tally.other = true;
                         break false;
                     }
                     Ok(Ok(0) | Err(_)) => break true,
                     Ok(Ok(n)) => n,
                 };
                 read += bytes;
-                other = true;
+                tally.other = true;
                 if read > MAX_READ {
                     break true;
                 }
@@ -689,19 +723,12 @@ pub async fn probe(dial: &Dial, destination: [u8; 16], within: Duration, attempt
             };
             if closed {
                 // Closed after it had the request: not a refusal.
-                other = true;
+                tally.other = true;
                 break;
             }
         }
     }
-    let probed = if passed {
-        Probed::Passed
-    } else if dial.backbone && !other && closed_empty == connections && connections + refused > 0 {
-        Probed::Refused
-    } else {
-        Probed::Failed
-    };
-    report(probed);
+    report(tally.verdict(passed, dial.backbone));
     if let Some((stream, opened)) = held {
         if let Some(until) = opened.checked_add(dial.hold) {
             tokio::time::sleep_until(until).await;
@@ -761,7 +788,7 @@ mod tests {
     /// a destination of its own: the handle, and the destination's address.
     async fn reticulum(dir: &std::path::Path, head: &str, interfaces: &str) -> (ReticulumHandle, RegisteredDestination, [u8; 16]) {
         let text = format!("[reticulum]\n  share_instance = No\n  enable_transport = No\n{head}\n[interfaces]\n{interfaces}");
-        std::fs::write(dir.join("config"), text).unwrap();
+        std::fs::write(dir.join("config"), crate::reticulum::with_cheap_stamps(&text)).unwrap();
         let handle = rns_runtime::reticulum::init_with_options(
             Some(dir.to_str().unwrap()),
             None,
@@ -778,8 +805,13 @@ mod tests {
     }
 
     async fn probed_as(dial: &Dial, destination: [u8; 16], within: Duration) -> Probed {
+        probed_each(dial, destination, within, Duration::from_secs(2)).await
+    }
+
+    /// [`probed_as`], with a new request every `attempt`.
+    async fn probed_each(dial: &Dial, destination: [u8; 16], within: Duration, attempt: Duration) -> Probed {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        probe(dial, destination, within, Duration::from_secs(2), |probed| {
+        probe(dial, destination, within, attempt, |probed| {
             let _ = tx.send(probed);
         })
         .await;
@@ -1089,9 +1121,10 @@ mod tests {
                 Probed::Failed,
                 "only a Backbone listener"
             );
-            // Connections refused outright, every time.
+            // Connections refused outright, every time. (Windows says so on loopback
+            // only after about two seconds of trying: the attempt has to outlast that.)
             let gone = SocketAddr::from(([127, 0, 0, 1], free_port()));
-            assert_eq!(probed_as(&dial(gone, true), [9; 16], Duration::from_secs(20)).await, Probed::Refused);
+            assert_eq!(probed_each(&dial(gone, true), [9; 16], Duration::from_secs(30), Duration::from_secs(5)).await, Probed::Refused);
             assert_eq!(probed_as(&dial(gone, false), [9; 16], Duration::from_secs(2)).await, Probed::Failed);
             // One that takes the connection and says nothing isn't "refused".
             let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1114,22 +1147,48 @@ mod tests {
                 }
             });
             assert_eq!(probed_as(&dial(late_at, true), [9; 16], Duration::from_secs(5)).await, Probed::Failed);
-            // An address that drops packets (here: a listener with a full backlog) is a failure,
-            // not a refusal.
-            let socket = tokio::net::TcpSocket::new_v4().unwrap();
-            socket.bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-            let full_at = socket.local_addr().unwrap();
-            let _full = socket.listen(0).unwrap();
-            let mut waiting = Vec::new();
-            for _ in 0..4 {
-                waiting.push(tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(full_at)).await);
-            }
-            assert!(waiting.iter().any(Result::is_err), "the backlog is full: some connect hangs");
-            assert_eq!(probed_as(&dial(full_at, true), [9; 16], Duration::from_secs(5)).await, Probed::Failed);
             // One that sends junk and closes isn't either.
             let junk = fake_listener(|_| vec![0x7e, 1, 2, 3, 0x7e]).await;
             assert_eq!(probed_as(&dial(junk, true), [9; 16], Duration::from_secs(3)).await, Probed::Failed);
         });
+    }
+
+    /// How the connections of a probe add up, whatever the sockets of the
+    /// system do (a full backlog hangs a connect on Linux, not everywhere).
+    #[test]
+    fn a_probe_is_refused_only_when_every_connection_was_turned_away() {
+        use std::io::ErrorKind::{ConnectionRefused, ConnectionReset, TimedOut};
+        let tally = |connects: &[std::io::ErrorKind], closed_empty: usize| {
+            let mut tally = Tally::default();
+            for kind in connects {
+                tally.connect_failed(*kind);
+            }
+            tally.connections = closed_empty;
+            tally.closed_empty = closed_empty;
+            tally
+        };
+        let refused = tally(&[ConnectionRefused; 3], 0);
+        assert_eq!(refused.verdict(false, true), Probed::Refused);
+        assert_eq!(refused.verdict(false, false), Probed::Failed, "only a Backbone listener");
+        assert_eq!(refused.verdict(true, true), Probed::Passed, "an answer is an answer");
+        // Connections that were closed without a word count the same.
+        assert_eq!(tally(&[], 2).verdict(false, true), Probed::Refused);
+        assert_eq!(tally(&[ConnectionRefused], 2).verdict(false, true), Probed::Refused);
+        // Nothing tried, nothing refused.
+        assert_eq!(Tally::default().verdict(false, true), Probed::Failed);
+        // An address that drops packets is a failure, not a refusal, whatever else happened.
+        assert_eq!(tally(&[TimedOut], 0).verdict(false, true), Probed::Failed, "a connect that timed out");
+        assert_eq!(tally(&[ConnectionRefused, TimedOut, ConnectionRefused], 0).verdict(false, true), Probed::Failed);
+        assert_eq!(tally(&[TimedOut], 2).verdict(false, true), Probed::Failed);
+        assert_eq!(tally(&[ConnectionReset], 0).verdict(false, true), Probed::Failed, "any other trouble");
+        // One that said something, or closed after the request, isn't turning us away.
+        let mut spoke = tally(&[], 2);
+        spoke.other = true;
+        assert_eq!(spoke.verdict(false, true), Probed::Failed);
+        // A connection that wasn't closed empty (one more than were) isn't either.
+        let mut open = tally(&[ConnectionRefused], 2);
+        open.connections += 1;
+        assert_eq!(open.verdict(false, true), Probed::Failed);
     }
 
     #[test]
@@ -1261,6 +1320,29 @@ mod tests {
             let unstamped = Dial { stamp_cost: None, ..dial.clone() };
             assert!(!probed(&unstamped, hash, Duration::from_secs(3)).await, "enforced, so dropped");
             assert!(probed(&dial, hash, Duration::from_secs(20)).await);
+            handle.shutdown_and_wait().await;
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh test node answers its first path request at once. Since
+    /// rsReticulum 1.5.1 a destination's announces carry a destination stamp
+    /// (25 bits of work by default), and a path response is held until it is
+    /// made: in a debug build that is tens of seconds of one CPU, on one
+    /// stamp worker for the whole test process, so every probe of a fresh
+    /// node raced it.
+    #[test]
+    fn a_fresh_test_node_answers_its_first_probe_without_waiting_for_a_stamp() {
+        let dir = test_dir("first-probe");
+        let port = free_port();
+        let interfaces =
+            format!("  [[In]]\n    type = TCPServerInterface\n    enabled = yes\n    listen_ip = 127.0.0.1\n    listen_port = {port}\n");
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let (handle, _destination, hash) = reticulum(&dir, "", &interfaces).await;
+            let config = Config::parse(&std::fs::read_to_string(dir.join("config")).unwrap()).unwrap();
+            let dial = dial_of(&config, "In").unwrap();
+            assert!(probed(&dial, hash, Duration::from_secs(5)).await, "the path response waited for the destination stamp");
             handle.shutdown_and_wait().await;
         });
         let _ = std::fs::remove_dir_all(&dir);

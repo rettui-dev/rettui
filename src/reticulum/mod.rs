@@ -803,8 +803,65 @@ pub fn enable_discovery(text: &str, connect: u32) -> String {
     doc.text()
 }
 
+/// `text` for a Reticulum that a test starts in this process, with the
+/// destination stamp made cheap. rsReticulum stamps every announce (and path
+/// response) with 25 bits of work unless told otherwise: tens of seconds of
+/// one CPU in a debug build, on one stamp worker and one policy for the
+/// whole process, so a test that starts Reticulum without this races it.
+/// Every such test must use it, as the last Reticulum started sets the
+/// policy. A `[stamps]` section already there gets the key, not a second one.
+#[cfg(test)]
+pub(crate) fn with_cheap_stamps(text: &str) -> String {
+    const KEY: &str = "  destination_value = 0\n";
+    let is_key = |line: &str| line.split('=').next().is_some_and(|name| name.trim().eq_ignore_ascii_case("destination_value"));
+    if text.lines().any(is_key) {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 40);
+    let mut found = false;
+    for line in text.split_inclusive('\n') {
+        out.push_str(line);
+        if !found && line.trim().eq_ignore_ascii_case("[stamps]") {
+            found = true;
+            if !line.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(KEY);
+        }
+    }
+    if !found {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n[stamps]\n");
+        out.push_str(KEY);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cheap_stamps_are_added_once_to_a_config_for_a_test() {
+        let stamp = |text: &str| super::with_cheap_stamps(text);
+        let added = stamp("[reticulum]\n  share_instance = No\n[interfaces]\n  [[A]]\n    type = AutoInterface\n");
+        assert!(added.ends_with("\n[stamps]\n  destination_value = 0\n"), "{added}");
+        let parsed = |text: &str| rns_runtime::config::Config::parse(text).unwrap();
+        assert_eq!(parsed(&added).section("stamps").unwrap().get("destination_value"), Some("0"));
+        // A section that is there gets the key; its own keys stay.
+        let merged = stamp("[reticulum]\n[stamps]\n  enforce_stamps = yes\n[interfaces]\n");
+        assert_eq!(merged.matches("tamps]").count(), 1, "{merged}");
+        let section = parsed(&merged);
+        let section = section.section("stamps").unwrap();
+        assert_eq!((section.get("destination_value"), section.get("enforce_stamps")), (Some("0"), Some("yes")));
+        // One already set is left as it is, and a text with no end of line gets one.
+        let set = "[stamps]\n  destination_value = 3\n";
+        assert_eq!(stamp(set), set);
+        assert_eq!(stamp("[stamps]"), "[stamps]\n  destination_value = 0\n");
+        assert_eq!(stamp("[reticulum]"), "[reticulum]\n\n[stamps]\n  destination_value = 0\n");
+        assert_eq!(stamp(""), "\n[stamps]\n  destination_value = 0\n");
+    }
+
     #[test]
     fn making_an_entry_point_opens_a_listener_and_the_warning_goes() {
         let base = rns_runtime::config::Config::default_config();

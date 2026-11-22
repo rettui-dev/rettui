@@ -987,6 +987,7 @@ fn only_refusals_before_anything_changed_are_given_back() {
         (StatusCode::CONFLICT, "restarting"),
         (StatusCode::CONFLICT, "busy"),
         (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        (StatusCode::TOO_MANY_REQUESTS, "stamping"),
     ] {
         assert!(changed_nothing(Limited::Write, &reply(status, code)), "{code}");
     }

@@ -325,7 +325,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rettui-sender-lookups-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config"), "[reticulum]\n  enable_transport = No\n  share_instance = No\n\n[interfaces]\n").unwrap();
+        std::fs::write(
+            dir.join("config"),
+            crate::reticulum::with_cheap_stamps("[reticulum]\n  enable_transport = No\n  share_instance = No\n\n[interfaces]\n"),
+        )
+        .unwrap();
         let runtime = crate::net::start_runtime(Some(&dir.display().to_string())).await.unwrap();
         let known = crate::net::KnownIdentities::none();
         let alice = Identity::new();
@@ -352,7 +356,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rettui-holding-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("config"), "[reticulum]\n  enable_transport = No\n  share_instance = No\n\n[interfaces]\n").unwrap();
+        std::fs::write(
+            dir.join("config"),
+            crate::reticulum::with_cheap_stamps("[reticulum]\n  enable_transport = No\n  share_instance = No\n\n[interfaces]\n"),
+        )
+        .unwrap();
         let runtime = crate::net::start_runtime(Some(&dir.display().to_string())).await.unwrap();
         let known = crate::net::KnownIdentities::none();
         let policy = crate::lxmf::Policy::load(&dir.join("tickets.json"), None, 1_000_000);

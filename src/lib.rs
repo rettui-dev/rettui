@@ -984,7 +984,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rettui-run-with-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("rns")).unwrap();
-        std::fs::write(dir.join("rns/config"), "[reticulum]\n  share_instance = No\n\n[interfaces]\n").unwrap();
+        std::fs::write(dir.join("rns/config"), crate::reticulum::with_cheap_stamps("[reticulum]\n  share_instance = No\n\n[interfaces]\n"))
+            .unwrap();
         std::fs::create_dir_all(dir.join("data")).unwrap();
         std::fs::write(dir.join("data/settings.json"), r#"{"update_check": false, "welcomed": true}"#).unwrap();
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

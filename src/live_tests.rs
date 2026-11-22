@@ -57,7 +57,7 @@ impl Peer {
             "[reticulum]\n  enable_transport = No\n  share_instance = No\n  panic_on_interface_error = No\n{reticulum}\n\
              [logging]\n  loglevel = 2\n\n[interfaces]\n{interface}"
         );
-        std::fs::write(rns.join("config"), config).unwrap();
+        std::fs::write(rns.join("config"), crate::reticulum::with_cheap_stamps(&config)).unwrap();
         let paths = Paths::new(Some(dir.clone())).unwrap();
         let mut chosen = Settings {
             display_name: name.to_string(),
@@ -708,10 +708,10 @@ async fn the_command_line_against_a_running_rettui() {
     std::fs::create_dir_all(&rns).unwrap();
     std::fs::write(
         rns.join("config"),
-        format!(
+        crate::reticulum::with_cheap_stamps(&format!(
             "[reticulum]\n  share_instance = No\n\n[interfaces]\n  [[To Amy]]\n    type = TCPClientInterface\n    \
              enabled = Yes\n    target_host = 127.0.0.1\n    target_port = {port}\n{TAKE_ALL}"
-        ),
+        )),
     )
     .unwrap();
     let paths = Paths::new(Some(dir.clone())).unwrap();
@@ -1317,9 +1317,9 @@ async fn a_file_sent_to_an_rncp_listener() {
     std::fs::create_dir_all(&saved).unwrap();
     std::fs::write(
         rns.join("config"),
-        format!(
+        crate::reticulum::with_cheap_stamps(&format!(
             "[reticulum]\n  enable_transport = No\n  share_instance = No\n\n[interfaces]\n  [[To Amy]]\n    type = TCPClientInterface\n    enabled = Yes\n    target_host = 127.0.0.1\n    target_port = {port}\n{TAKE_ALL}"
-        ),
+        )),
     )
     .unwrap();
     let runtime = net::start_runtime(Some(&rns.display().to_string())).await.unwrap();

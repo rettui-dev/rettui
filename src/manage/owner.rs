@@ -32,6 +32,7 @@ use super::pending::{self, Pending, RestoreError, State};
 use super::recent::{ChangeLimits, Moment, StorageHistory};
 use super::rnsedit::{self, RnsChange, RnsRefusal};
 use super::selftest::{self, Prober, Run};
+use super::stamps::{Making, StampCheck};
 use super::{Job, Op, Reply, unix_now};
 use crate::app::{App, NetState};
 use crate::config::{self, FieldKind, Paths, Settings};
@@ -50,6 +51,14 @@ const MAX_MESSAGE: usize = 300;
 pub const APPLIES_PER_HOUR: usize = 4;
 /// How long the next change waits after one was put back by itself.
 pub const HOLD_AFTER_ROLLBACK: Duration = Duration::from_secs(15 * 60);
+/// How long a Reticulum config change is held back for the node's announce
+/// stamp, counted from the first request it held back. A stamp takes seconds
+/// on a computer and a few minutes on a small device; one still not there
+/// after this is not coming (stamping off, or stuck), and changes go on as
+/// they did before.
+pub const STAMP_WAIT: Duration = Duration::from_secs(30 * 60);
+/// How long a held-back request is told to wait before it asks again.
+const STAMP_RETRY: u64 = 60;
 /// What a Reticulum that failed is reported as (why is in the node's log,
 /// and may quote the config).
 const NOT_STARTED: &str = "Reticulum didn't start (see the node's log)";
@@ -72,6 +81,8 @@ pub(crate) struct Timing {
     pub hold_after_rollback: Duration,
     /// How long a self-test request waits for its answer before another is sent.
     pub self_test_attempt: Duration,
+    /// How long a config change is held back for the node's announce stamp.
+    pub stamp_wait: Duration,
 }
 
 impl Default for Timing {
@@ -84,6 +95,7 @@ impl Default for Timing {
             apply_window: Duration::from_secs(3600),
             hold_after_rollback: HOLD_AFTER_ROLLBACK,
             self_test_attempt: selftest::ATTEMPT,
+            stamp_wait: STAMP_WAIT,
         }
     }
 }
@@ -181,6 +193,19 @@ struct ChangeResult {
     message: String,
 }
 
+/// Where the wait for the node's announce stamp stands (see [`StampCheck`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum StampWait {
+    /// Nothing is being waited for.
+    #[default]
+    Idle,
+    /// Config changes have been held back since `since`, the last time at `last`.
+    Since { since: Instant, last: Instant },
+    /// The wait ran out: changes go on without the stamp until it is there
+    /// or Reticulum is restarted.
+    GaveUp,
+}
+
 /// Runs management jobs against the app (see [`Owner::run`]).
 #[derive(Debug)]
 pub struct Owner {
@@ -202,6 +227,14 @@ pub struct Owner {
     storage: StorageHistory,
     /// Where the self-test of a change dials.
     prober: Prober,
+    /// How the node's announce stamp is looked for, and how long a change
+    /// has waited for it.
+    stamps: StampCheck,
+    stamp_wait: StampWait,
+    /// The stamp this node started making for a held-back change.
+    making: Option<Making>,
+    /// How many of its jobs have ended without the stamp saved, in this wait.
+    stamp_jobs_ended: u8,
 }
 
 /// `span` in words: whole hours as hours, else minutes.
@@ -288,6 +321,10 @@ impl Owner {
             limits,
             storage: StorageHistory::load(paths),
             prober: Prober::default(),
+            stamps: StampCheck::default(),
+            stamp_wait: StampWait::default(),
+            making: None,
+            stamp_jobs_ended: 0,
         }
     }
 
@@ -401,6 +438,8 @@ impl Owner {
     fn mark_restart(&mut self, app: &App) {
         self.limits.restarted = Some(Moment::now());
         self.limits.save(&app.paths);
+        // A new Reticulum starts its stamp over, and gets a new wait.
+        self.end_stamp_wait();
     }
 
     /// Add `record` to the audit log and the node's log (where what the
@@ -773,6 +812,11 @@ impl Owner {
             Ok(planned) => planned,
             Err(refusal) => return self.rns_refusal(app, actor, asked, refusal),
         };
+        if let Some(wait) = self.stamp_hold(app, &planned.after) {
+            let message = "Not ready yet: the node is still making its announce stamp, which Reticulum needs to answer the test of a change. \
+                Nothing was changed: try again shortly";
+            return refuse(self, app, StatusCode::TOO_MANY_REQUESTS, "stamping", message, asked).with("retry_after", wait);
+        }
         let id = new_id();
         let now = unix_now();
         // What was online and is in this config must be back, but what the change turns off.
@@ -857,6 +901,73 @@ impl Owner {
         live.test = Run::plan(&planned.after, &live.record.required);
         self.pending = Some(live);
         Reply::new(StatusCode::ACCEPTED, body)
+    }
+
+    /// Nothing is waited for: the next held request starts a wait of its own.
+    fn end_stamp_wait(&mut self) {
+        self.stamp_wait = StampWait::Idle;
+        self.stamp_jobs_ended = 0;
+    }
+
+    /// How long a request to apply `after` to the Reticulum config is to
+    /// wait for the node's announce stamp, in seconds, if it is. Reticulum
+    /// holds back the announce and the path response a self-test needs until
+    /// the stamp is made, and starts it over at every restart, so a change
+    /// applied before it exists is put back whatever it was. Held-back
+    /// requests are refused as a rate limit is, so they use up neither a
+    /// change slot nor a write of the budget. After [`Timing::stamp_wait`] the
+    /// stamp is taken as not coming, and the change goes on. A rollback is
+    /// not asked here: the old config goes back at once.
+    fn stamp_hold(&mut self, app: &mut App, after: &str) -> Option<u64> {
+        let (Some(address), Some(key)) = (app.lxmf_hash, app.public_key) else { return None };
+        let config = app.rns_path();
+        if self.stamps.ready(&config, &address, &key, after) {
+            self.end_stamp_wait();
+            self.making = None;
+            return None;
+        }
+        let now = Instant::now();
+        // One job at a time. One that goes on is let be, also after the wait is given up (it saves
+        // the stamp when it is done, and the next change finds it). One that has ended without the
+        // stamp saved is replaced once in a wait: a second means the stamp can't be saved (a folder
+        // that can't be written), and another computation of it each time would only burn the
+        // processor.
+        if self.making.as_mut().is_some_and(Making::ended) {
+            match self.stamp_jobs_ended {
+                0 => self.making = None,
+                1 => app.log(
+                    "Remote management: the node's announce stamp was made but could not be saved: Reticulum's storage folder needs to be writable",
+                ),
+                _ => {}
+            }
+            self.stamp_jobs_ended = self.stamp_jobs_ended.saturating_add(1).min(2);
+        }
+        if self.making.is_none() {
+            self.making = self.stamps.start(&config, &address, &key);
+        }
+        // Not asked for longer than the wait itself: the stamp may have been lost since, and is
+        // waited for anew. Shorter gaps (a person pressing Apply again) keep the wait going.
+        if let StampWait::Since { last, .. } = self.stamp_wait
+            && last.elapsed() > self.timing.stamp_wait
+        {
+            self.end_stamp_wait();
+        }
+        let since = match self.stamp_wait {
+            StampWait::GaveUp => return None,
+            StampWait::Since { since, .. } => since,
+            StampWait::Idle => now,
+        };
+        let left = self.timing.stamp_wait.saturating_sub(since.elapsed());
+        if left.is_zero() {
+            self.stamp_wait = StampWait::GaveUp;
+            app.log(format!(
+                "Remote management: the node's announce stamp is still not made after {}: config changes are applied without waiting for it",
+                span(self.timing.stamp_wait)
+            ));
+            return None;
+        }
+        self.stamp_wait = StampWait::Since { since, last: now };
+        Some(STAMP_RETRY.min(left.as_secs().saturating_add(u64::from(left.subsec_nanos() > 0))).max(1))
     }
 
     /// How long until the next config change may be applied, and why, if
@@ -2500,5 +2611,264 @@ mod tests {
         // A day later the first value no longer counts.
         node.owner.storage = StorageHistory::with(vec![(Duration::from_secs(25 * 3600), 1000)]);
         assert_eq!(cut(&mut node, "250").status, StatusCode::OK);
+    }
+
+    /// A node whose announce stamp is made while the first flag is `true`, and the times a
+    /// stamp was started for it.
+    fn with_stamp(name: &str) -> (Node, std::sync::Arc<std::sync::atomic::AtomicBool>, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let mut node = Node::with_rns(name, RNS);
+        node.app.public_key = Some([3; 64]);
+        let made = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        node.owner.stamps = StampCheck::Fixed(made.clone(), starts.clone(), std::sync::Arc::default());
+        (node, made, starts)
+    }
+
+    fn set_made(made: &std::sync::atomic::AtomicBool, value: bool) {
+        made.store(value, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_change_waits_for_the_announce_stamp_and_costs_nothing_meanwhile() {
+        let (mut node, made, starts) = with_stamp("rns-stamp-wait");
+        let slots = node.owner.limits.applies.len();
+        for _ in 0..3 {
+            let held = node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+            assert_eq!((held.status, held.body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("stamping")), "{}", held.body);
+            assert_eq!(held.body["retry_after"], 60);
+            let mut keys: Vec<&str> = held.body.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["error", "message", "retry_after"], "{}", held.body);
+            assert!(held.body["message"].as_str().unwrap().contains("still making its announce stamp"));
+        }
+        // Nothing was written, restarted or counted, and nothing is on probation.
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1, "a stamp is started, once, for what is held");
+        assert_eq!(node.config_text(), RNS);
+        assert!(!node.app.take_rns_restart());
+        assert!(node.pending_file().is_none());
+        assert_eq!(node.state()["pending"], Value::Null);
+        assert_eq!(node.owner.limits.applies.len(), slots);
+        assert!(node.app.rns_versions().is_empty(), "no history entry");
+        // The refusals are in the audit log, as refusals.
+        let audit = node.audit();
+        assert_eq!(audit.len(), 3);
+        assert!(audit.iter().all(|e| e["op"] == "reticulum" && e["result"] == "refused"), "{audit:?}");
+        assert!(audit[0]["error"].as_str().unwrap().contains("announce stamp"));
+        // Settings are not Reticulum's config: they go through.
+        assert_eq!(node.change(&[("pn_name", "Hilltop")]).status, StatusCode::OK);
+
+        // Once the stamp is made, the same change is applied and tested as usual.
+        set_made(&made, true);
+        let applied = node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        assert_eq!(applied.status, StatusCode::ACCEPTED, "{}", applied.body);
+        assert_eq!(node.owner.limits.applies.len(), slots + 1);
+        assert!(node.config_text().contains("enable_transport = Yes"));
+        node.restarted(&[HILL]);
+        node.tick();
+        assert_eq!(node.state()["pending"]["state"], "probation");
+    }
+
+    #[test]
+    fn the_wait_for_the_stamp_ends_when_it_does_not_come() {
+        let (mut node, _made, _starts) = with_stamp("rns-stamp-bound");
+        // The waits here are long enough for a busy machine: no gap between two tries may be as long as the wait.
+        node.owner.timing.stamp_wait = Duration::from_millis(1000);
+        let held = node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        assert_eq!(held.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(held.body["retry_after"], 1, "no longer than what is left of the wait");
+        assert!(matches!(node.owner.stamp_wait, StampWait::Since { .. }));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]).status, StatusCode::TOO_MANY_REQUESTS);
+        std::thread::sleep(Duration::from_millis(600));
+        // The stamp is still not there: the change goes on, as it did before the wait, and it is said.
+        let applied = node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        assert_eq!(applied.status, StatusCode::ACCEPTED, "{}", applied.body);
+        assert!(node.app.log.iter().any(|l| l.contains("announce stamp is still not made after 0 minutes")));
+        assert_eq!(node.owner.limits.applies.len(), 1);
+        assert!(node.owner.making.is_some(), "the work goes on, to save the stamp when it is done");
+    }
+
+    #[test]
+    fn a_restart_ends_the_giving_up_and_the_next_change_waits_again() {
+        let (mut node, _made, _starts) = with_stamp("rns-stamp-again");
+        node.owner.timing.stamp_wait = Duration::ZERO;
+        node.owner.timing.restart_every = Duration::ZERO;
+        let applied = node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        assert_eq!(applied.status, StatusCode::ACCEPTED, "{}", applied.body);
+        // The restart that change made started the stamp over: nothing is given up now.
+        assert_eq!(node.owner.stamp_wait, StampWait::Idle);
+        node.restarted(&[HILL]);
+        node.tick();
+        let id = applied.body["id"].as_str().unwrap().to_string();
+        assert_eq!(node.ask(Op::Confirm { id }).status, StatusCode::OK);
+        node.owner.timing.stamp_wait = Duration::from_secs(600);
+        let next = node.apply(300, &[(&["interfaces", HILL], "mode", "boundary")]);
+        assert_eq!((next.status, next.body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("stamping")), "{}", next.body);
+        assert!(matches!(node.owner.stamp_wait, StampWait::Since { .. }));
+        // A restart asked for (here: by the owner's own bookkeeping) ends a given-up wait as well.
+        node.owner.stamp_wait = StampWait::GaveUp;
+        let app = &node.app;
+        node.owner.mark_restart(app);
+        assert_eq!(node.owner.stamp_wait, StampWait::Idle);
+    }
+
+    /// The flag that ends the job a test node has started.
+    fn job_ended(node: &Node) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        match &node.owner.stamps {
+            StampCheck::Fixed(_, _, ended) => ended.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_person_asking_again_every_few_minutes_still_reaches_the_end_of_the_wait() {
+        let (mut node, _made, _starts) = with_stamp("rns-stamp-retries");
+        // 1500 ms stands for 30 minutes, and 400 ms for the 8 minutes between two tries.
+        node.owner.timing.stamp_wait = Duration::from_millis(1500);
+        let ask = |node: &mut Node| node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        for _ in 0..3 {
+            std::thread::sleep(Duration::from_millis(400));
+            assert_eq!(ask(&mut node).body["error"], "stamping", "within the wait, counted from the first refusal");
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        let applied = ask(&mut node);
+        assert_eq!(applied.status, StatusCode::ACCEPTED, "{}", applied.body);
+        assert!(node.app.log.iter().any(|l| l.contains("still not made")));
+    }
+
+    #[test]
+    fn a_wait_not_asked_into_for_its_whole_length_is_over_and_a_stamp_lost_since_is_waited_for_anew() {
+        let (mut node, made, starts) = with_stamp("rns-stamp-stale");
+        node.owner.timing.stamp_wait = Duration::from_millis(1000);
+        let ask = |node: &mut Node| node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        // The stamp was made, and lost again (a value raised, a file gone), and nobody asked for longer than the wait.
+        set_made(&made, true);
+        set_made(&made, false);
+        std::thread::sleep(Duration::from_millis(1100));
+        let again = ask(&mut node);
+        assert_eq!((again.status, again.body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("stamping")), "{}", again.body);
+        assert!(matches!(node.owner.stamp_wait, StampWait::Since { .. }));
+        assert!(node.app.log.iter().all(|l| !l.contains("still not made")), "it did not give up");
+        assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1, "the work already started goes on");
+        // Asked into soon enough, as a person does, the same wait runs out.
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(ask(&mut node).status, StatusCode::ACCEPTED);
+        assert!(node.app.log.iter().any(|l| l.contains("still not made")));
+    }
+
+    #[test]
+    fn a_job_that_ended_without_the_stamp_is_replaced_and_one_that_goes_on_is_not() {
+        let (mut node, _made, starts) = with_stamp("rns-stamp-job");
+        let ask = |node: &mut Node| node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        let started = || starts.load(std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..3 {
+            assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert_eq!(started(), 1, "one job at a time");
+        // It ended (failed, or was cancelled) and the stamp is still not saved: another is started, once.
+        job_ended(&node).store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(started(), 2);
+        // The new job goes on.
+        job_ended(&node).store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert_eq!(started(), 2);
+        // Giving up lets a job that ended be replaced too, and the work of one that goes on is kept.
+        node.owner.timing.stamp_wait = Duration::ZERO;
+        assert_eq!(ask(&mut node).status, StatusCode::ACCEPTED);
+        assert_eq!(started(), 2);
+        assert!(node.owner.making.is_some());
+    }
+
+    #[test]
+    fn a_stamp_that_cannot_be_saved_is_made_twice_at_most_in_a_wait_and_said_once() {
+        let (mut node, made, starts) = with_stamp("rns-stamp-unsaved");
+        let ask = |node: &mut Node| node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        let started = || starts.load(std::sync::atomic::Ordering::SeqCst);
+        let told = |node: &Node| node.app.log.iter().filter(|l| l.contains("could not be saved")).count();
+        assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        // Every job ends at once, with the stamp made and not saved.
+        job_ended(&node).store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..10 {
+            assert_eq!(ask(&mut node).body["error"], "stamping", "still held, as before");
+        }
+        assert_eq!(started(), 2, "one more try, not one for each request");
+        assert_eq!(told(&node), 1, "said once");
+        assert!(node.app.log.iter().any(|l| l.contains("storage folder needs to be writable")));
+        // The wait still ends as it does: the change goes on after it.
+        node.owner.timing.stamp_wait = Duration::ZERO;
+        assert_eq!(ask(&mut node).status, StatusCode::ACCEPTED);
+        assert_eq!(started(), 2);
+        // A restart is a new wait, with its own two tries; a stamp saved ends them.
+        node.owner.timing.stamp_wait = Duration::from_secs(600);
+        node.owner.timing.restart_every = Duration::ZERO;
+        node.restarted(&[HILL]);
+        node.tick();
+        let id = node.state()["pending"]["id"].as_str().unwrap().to_string();
+        assert_eq!(node.ask(Op::Confirm { id }).status, StatusCode::OK);
+        let ask = |node: &mut Node| node.apply(300, &[(&["interfaces", HILL], "mode", "boundary")]);
+        for _ in 0..3 {
+            assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert_eq!(started(), 3, "the job left from before had ended: one more try, then said");
+        assert_eq!(told(&node), 2);
+        set_made(&made, true);
+        assert_ne!(ask(&mut node).body["error"], "stamping");
+        assert_eq!(node.owner.stamp_jobs_ended, 0);
+    }
+
+    /// The sequence that once took the node down: a job (a real future) that ended without the
+    /// stamp saved, and requests held after it.
+    #[test]
+    fn a_job_that_has_finished_is_never_polled_again_by_the_requests_held_after_it() {
+        let mut node = Node::with_rns("rns-stamp-finished", RNS);
+        node.app.public_key = Some([3; 64]);
+        let starts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        node.owner.stamps = StampCheck::Finishing(starts.clone());
+        let ask = |node: &mut Node| node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
+        let started = || starts.load(std::sync::atomic::Ordering::SeqCst);
+        let told = |node: &Node| node.app.log.iter().filter(|l| l.contains("could not be saved")).count();
+        for n in 0..8 {
+            let held = ask(&mut node);
+            assert_eq!((held.status, held.body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("stamping")), "{n}");
+        }
+        assert_eq!((started(), told(&node)), (2, 1));
+        // After the wait is given up.
+        node.owner.timing.stamp_wait = Duration::ZERO;
+        assert_eq!(ask(&mut node).status, StatusCode::ACCEPTED);
+        // And after a restart: a new wait, the job from before still there.
+        node.owner.timing.stamp_wait = Duration::from_secs(600);
+        node.owner.timing.restart_every = Duration::ZERO;
+        node.restarted(&[HILL]);
+        node.tick();
+        let id = node.state()["pending"]["id"].as_str().unwrap().to_string();
+        assert_eq!(node.ask(Op::Confirm { id }).status, StatusCode::OK);
+        let ask = |node: &mut Node| node.apply(300, &[(&["interfaces", HILL], "mode", "boundary")]);
+        for n in 0..6 {
+            let held = ask(&mut node);
+            assert_eq!((held.status, held.body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("stamping")), "{n}");
+        }
+        assert_eq!((started(), told(&node)), (3, 2));
+    }
+
+    #[test]
+    fn a_rollback_does_not_wait_for_the_stamp() {
+        let (mut node, made, _starts) = with_stamp("rns-stamp-rollback");
+        set_made(&made, true);
+        let id = node.reach_probation(0);
+        // The stamp is gone again (a restart started it over): the old config still goes back.
+        set_made(&made, false);
+        node.tick();
+        assert_eq!(node.config_text(), RNS);
+        assert_eq!(node.state()["pending"]["state"], "rolling_back");
+        node.restarted(&[HILL]);
+        node.tick();
+        assert_rolled_back(&mut node, &id, "No confirm by the deadline");
     }
 }

@@ -1380,7 +1380,11 @@ mod tests {
         for attempt in 0..3 {
             let root = dir.join(attempt.to_string());
             std::fs::create_dir_all(root.join("rns")).unwrap();
-            std::fs::write(root.join("rns/config"), "[reticulum]\n  share_instance = No\n\n[interfaces]\n").unwrap();
+            std::fs::write(
+                root.join("rns/config"),
+                crate::reticulum::with_cheap_stamps("[reticulum]\n  share_instance = No\n\n[interfaces]\n"),
+            )
+            .unwrap();
             let paths = Paths::new(Some(root.join("data"))).unwrap();
             let settings = Settings {
                 update_check: false,
@@ -1541,9 +1545,9 @@ mod tests {
 
     /// The Reticulum config of the tests below: a TCP server on `port`, named as an operator would.
     fn hilltop(port: u16) -> String {
-        format!(
+        crate::reticulum::with_cheap_stamps(&format!(
             "# A node's config\n[reticulum]\n  share_instance = No\n  enable_transport = No   # for now\n\n[interfaces]\n  # The way in\n  [[Hilltop TCP]]\n    type = TCPServerInterface\n    enabled = Yes\n    listen_ip = 127.0.0.1\n    listen_port = {port}\n"
-        )
+        ))
     }
 
     fn online(state: &serde_json::Value) -> bool {
@@ -1730,7 +1734,11 @@ mod tests {
         for attempt in 0..3 {
             let root = dir.join(attempt.to_string());
             std::fs::create_dir_all(root.join("rns")).unwrap();
-            std::fs::write(root.join("rns/config"), "[reticulum]\n  share_instance = No\n\n[interfaces]\n").unwrap();
+            std::fs::write(
+                root.join("rns/config"),
+                crate::reticulum::with_cheap_stamps("[reticulum]\n  share_instance = No\n\n[interfaces]\n"),
+            )
+            .unwrap();
             let paths = Paths::new(Some(root.join("data"))).unwrap();
             Settings { update_check: false, welcomed: true, ..Settings::default() }.save(&paths.settings).unwrap();
             let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();

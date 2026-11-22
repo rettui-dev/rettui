@@ -43,6 +43,7 @@ pub(crate) mod pending;
 mod recent;
 mod rnsedit;
 pub(crate) mod selftest;
+mod stamps;
 pub(crate) mod wire;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
@@ -775,7 +776,8 @@ type Counted = (Limited, Instant);
 
 /// Whether the owner's answer refused a write before anything changed, so
 /// it is given back to its limit: another change is pending, a restart or a
-/// change is running, or a Reticulum limit holds it back; for a confirm, any
+/// change is running, a Reticulum limit holds it back, or the node is still
+/// making its announce stamp; for a confirm, any
 /// refusal (another user's, or one for no pending change, can't use up the
 /// confirms its maker needs).
 fn changed_nothing(kind: Limited, reply: &Reply) -> bool {
@@ -785,7 +787,7 @@ fn changed_nothing(kind: Limited, reply: &Reply) -> bool {
     }
     match reply.status {
         StatusCode::CONFLICT => matches!(code, Some("pending" | "restarting" | "busy")),
-        StatusCode::TOO_MANY_REQUESTS => code == Some("rate_limited"),
+        StatusCode::TOO_MANY_REQUESTS => matches!(code, Some("rate_limited" | "stamping")),
         _ => false,
     }
 }

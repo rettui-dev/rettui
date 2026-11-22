@@ -879,6 +879,50 @@ node come back with it:
    kept in `manage/limits.json`, so stopping and starting the node doesn't
    reset them. A file that can't be read is set aside as
    `limits.json.unreadable-…`, and the next change waits 15 minutes.
+
+   A change also waits while the node is still making its announce stamp.
+   Reticulum 1.6.1 puts a small proof of work on every announce and path
+   response, and the node can't answer the test below until the stamp of its
+   own address exists. It takes seconds on a computer and a few minutes on a
+   small device, it is saved once made, and a Reticulum restart before it is
+   done starts it over, so a change made in the meantime would be put back
+   however good it was. Instead the node refuses it, saying "Not ready yet:
+   the node is still making its announce stamp" (HTTP 429, error `stamping`,
+   with `retry_after` of at most 60 seconds), changes nothing, and counts it
+   neither against the hourly limit nor against the website's changes a
+   minute; the audit log has the refusal. Whoever made the change tries again
+   (the website doesn't retry by itself) once the stamp is there. Details:
+   - The node makes sure the stamp is being made: if Reticulum isn't doing it
+     (a node that doesn't announce does it only when asked for a path), the
+     first refusal starts it, and it goes on to save the stamp even after the
+     node has stopped waiting. A job that ended without saving a stamp is
+     replaced once in a wait; if the second one ends without it as well, the
+     node says in its log that the stamp could not be saved (Reticulum's
+     storage folder needs to be writable) and starts no more until the next
+     wait.
+   - The wait is 30 minutes from the first refusal, however far apart the
+     tries are. If the stamp still isn't saved by the first try after that
+     (stamping is stuck), the node applies the change as it did before, and
+     says so in its log. A new wait starts after a Reticulum restart (which
+     starts the stamp over), once the stamp has been seen saved, and when
+     nobody tried for 30 minutes or more.
+   - A change that sets `destination_value` to 18 or less isn't waited for,
+     saved stamp or none: Reticulum makes a stamp that cheap (about 260,000
+     tries) in seconds after the restart. A remote change can't set it (the
+     `[stamps]` section is not among the keys the website may change): set it
+     in the node's own config, from the terminal, and changes aren't waited
+     for after that. A higher value is waited for as above, using the stamp
+     saved at the value Reticulum runs with now.
+   - Only a plain file at the stamp's place counts as a saved stamp. The node
+     opens it once, without following a link and without waiting on a pipe, so
+     a link or pipe put there is ignored, and no stamp is started while
+     something like that is in the way.
+   - A change that raises `destination_value` is not held for the stronger
+     stamp, since nothing makes it before the restart: it may be put back
+     until the node has made the new stamp (set the value from the terminal
+     first, and let it finish).
+   - Putting a change back never waits for the stamp, and neither do
+     settings and restarts.
 3. The old text is kept in the config history (Reticulum tab, `H`) and the
    new one saved, with the change on probation in `manage/pending.json`
    (readable by the node's user only; it holds checksums of the file before
