@@ -2694,15 +2694,14 @@ mod tests {
     #[test]
     fn the_wait_for_the_stamp_ends_when_it_does_not_come() {
         let (mut node, _made, _starts) = with_stamp("rns-stamp-bound");
-        // The waits here are long enough for a busy machine: no gap between two tries may be as long as the wait.
-        node.owner.timing.stamp_wait = Duration::from_millis(1000);
+        node.owner.timing.stamp_wait = Duration::from_secs(30);
         let held = node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
         assert_eq!(held.status, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(held.body["retry_after"], 1, "no longer than what is left of the wait");
+        assert_eq!(held.body["retry_after"], 30, "no longer than what is left of the wait");
         assert!(matches!(node.owner.stamp_wait, StampWait::Since { .. }));
-        std::thread::sleep(Duration::from_millis(500));
+        age_stamp_wait(&mut node, Duration::from_secs(15));
         assert_eq!(node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]).status, StatusCode::TOO_MANY_REQUESTS);
-        std::thread::sleep(Duration::from_millis(600));
+        age_stamp_wait(&mut node, Duration::from_secs(16));
         // The stamp is still not there: the change goes on, as it did before the wait, and it is said.
         let applied = node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
         assert_eq!(applied.status, StatusCode::ACCEPTED, "{}", applied.body);
@@ -2735,6 +2734,19 @@ mod tests {
         assert_eq!(node.owner.stamp_wait, StampWait::Idle);
     }
 
+    /// Makes the wait for the stamp `by` older, as if that much time had passed since it began
+    /// and since the last try. The tests move the clock this way and never sleep, so a slow
+    /// machine can't make a wait run out early or late.
+    fn age_stamp_wait(node: &mut Node, by: Duration) {
+        match &mut node.owner.stamp_wait {
+            StampWait::Since { since, last } => {
+                *since = since.checked_sub(by).expect("the machine has been up longer than that");
+                *last = last.checked_sub(by).expect("the machine has been up longer than that");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The flag that ends the job a test node has started.
     fn job_ended(node: &Node) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
         match &node.owner.stamps {
@@ -2746,15 +2758,15 @@ mod tests {
     #[test]
     fn a_person_asking_again_every_few_minutes_still_reaches_the_end_of_the_wait() {
         let (mut node, _made, _starts) = with_stamp("rns-stamp-retries");
-        // 1500 ms stands for 30 minutes, and 400 ms for the 8 minutes between two tries.
-        node.owner.timing.stamp_wait = Duration::from_millis(1500);
+        // 30 seconds stand for the 30 minutes, and 8 seconds for the 8 minutes between two tries.
+        node.owner.timing.stamp_wait = Duration::from_secs(30);
         let ask = |node: &mut Node| node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
         assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
         for _ in 0..3 {
-            std::thread::sleep(Duration::from_millis(400));
+            age_stamp_wait(&mut node, Duration::from_secs(8));
             assert_eq!(ask(&mut node).body["error"], "stamping", "within the wait, counted from the first refusal");
         }
-        std::thread::sleep(Duration::from_millis(400));
+        age_stamp_wait(&mut node, Duration::from_secs(8));
         let applied = ask(&mut node);
         assert_eq!(applied.status, StatusCode::ACCEPTED, "{}", applied.body);
         assert!(node.app.log.iter().any(|l| l.contains("still not made")));
@@ -2763,22 +2775,22 @@ mod tests {
     #[test]
     fn a_wait_not_asked_into_for_its_whole_length_is_over_and_a_stamp_lost_since_is_waited_for_anew() {
         let (mut node, made, starts) = with_stamp("rns-stamp-stale");
-        node.owner.timing.stamp_wait = Duration::from_millis(1000);
+        node.owner.timing.stamp_wait = Duration::from_secs(30);
         let ask = |node: &mut Node| node.apply(300, &[(&["reticulum"], "enable_transport", "yes")]);
         assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
         // The stamp was made, and lost again (a value raised, a file gone), and nobody asked for longer than the wait.
         set_made(&made, true);
         set_made(&made, false);
-        std::thread::sleep(Duration::from_millis(1100));
+        age_stamp_wait(&mut node, Duration::from_secs(31));
         let again = ask(&mut node);
         assert_eq!((again.status, again.body["error"].as_str()), (StatusCode::TOO_MANY_REQUESTS, Some("stamping")), "{}", again.body);
         assert!(matches!(node.owner.stamp_wait, StampWait::Since { .. }));
         assert!(node.app.log.iter().all(|l| !l.contains("still not made")), "it did not give up");
         assert_eq!(starts.load(std::sync::atomic::Ordering::SeqCst), 1, "the work already started goes on");
         // Asked into soon enough, as a person does, the same wait runs out.
-        std::thread::sleep(Duration::from_millis(600));
+        age_stamp_wait(&mut node, Duration::from_secs(16));
         assert_eq!(ask(&mut node).status, StatusCode::TOO_MANY_REQUESTS);
-        std::thread::sleep(Duration::from_millis(600));
+        age_stamp_wait(&mut node, Duration::from_secs(16));
         assert_eq!(ask(&mut node).status, StatusCode::ACCEPTED);
         assert!(node.app.log.iter().any(|l| l.contains("still not made")));
     }
