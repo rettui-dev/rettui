@@ -1389,6 +1389,19 @@ mod tests {
             std::fs::read_to_string(self.app.rns_path()).unwrap()
         }
 
+        /// Stops the clock on the waits, so a test can look at a job that is still inside its time
+        /// however long the files took to write (a slow disk can take longer than the 200 ms).
+        fn hold_waits(&mut self) {
+            self.owner.timing.health_within = Duration::from_secs(60);
+            self.owner.timing.rollback_within = Duration::from_secs(60);
+        }
+
+        /// Puts the short waits back, so the next sleep runs them out.
+        fn short_waits(&mut self) {
+            self.owner.timing.health_within = Duration::from_millis(200);
+            self.owner.timing.rollback_within = Duration::from_millis(200);
+        }
+
         fn pending_file(&self) -> Option<Pending> {
             pending::load(&self.app.paths).unwrap()
         }
@@ -1710,8 +1723,10 @@ mod tests {
         let first = node.ask(Op::Restart);
         node.app.take_rns_restart();
         node.app.net_state = NetState::Online;
+        node.hold_waits();
         node.owner.on_tick(&mut node.app);
         assert_eq!(node.state()["restart"]["state"], "restarting", "it has 90 seconds (here 200 ms)");
+        node.short_waits();
         std::thread::sleep(Duration::from_millis(250));
         node.owner.on_tick(&mut node.app);
         let state = node.state();
@@ -1967,15 +1982,19 @@ mod tests {
         let reply = node.apply(300, &[(&["interfaces", HILL], "mode", "boundary")]);
         let id = reply.body["id"].as_str().unwrap().to_string();
         node.restarted(&["Spare"]);
+        node.hold_waits();
         node.tick();
         assert_eq!(node.state()["pending"]["state"], "restarting", "it has 90 seconds (here 200 ms)");
+        node.short_waits();
         std::thread::sleep(Duration::from_millis(250));
         node.tick();
         assert_eq!(node.config_text(), RNS);
         // The old config isn't back within the time either.
         assert!(node.app.take_rns_restart());
+        node.hold_waits();
         node.tick();
         assert_eq!(node.state()["pending"]["state"], "rolling_back");
+        node.short_waits();
         std::thread::sleep(Duration::from_millis(250));
         node.tick();
         assert_rolled_back(&mut node, &id, "Hilltop TCP is offline");
@@ -2019,14 +2038,17 @@ mod tests {
         // Back with both, but not answering yet: still restarting.
         node.owner.prober = Prober::Fixed(HashMap::new());
         node.restarted(&[HILL, "Radio"]);
+        node.hold_waits();
         node.tick();
         let state = node.state();
         assert_eq!(state["pending"]["state"], "restarting");
         assert_eq!(state["pending"]["problems"], json!(["Waiting for Reticulum on Hilltop TCP to answer a test request"]));
         assert_eq!(state["pending"]["checks"][1], json!({ "interface": "Radio", "kind": "online", "result": "no_traffic" }));
         // Not answered within the time: rolled back, with a fixed reason.
+        node.short_waits();
         std::thread::sleep(Duration::from_millis(250));
         node.tick();
+        node.hold_waits();
         assert_eq!(node.config_text(), rns);
         assert_eq!(node.state()["pending"]["problems"], json!(["Reticulum on Hilltop TCP did not answer a test request"]));
         // The old config is tested too, for the record; it is kept however that goes.
@@ -2034,6 +2056,7 @@ mod tests {
         node.tick();
         assert_eq!(node.state()["pending"]["state"], "rolling_back", "waiting for the test of the old config");
         assert_eq!(node.state()["pending"]["checks"][0]["result"], "waiting");
+        node.short_waits();
         std::thread::sleep(Duration::from_millis(250));
         node.tick();
         let state = node.state();
