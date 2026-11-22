@@ -24,11 +24,12 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
 use crate::app::App;
 use crate::app::node::NodeStatus;
 use crate::net::PeerKind;
+use crate::remote_manage::{PeerSlot, Peers, peer_ip};
 use rns_transport::constants::MAX_QUEUED_ANNOUNCES;
 
 /// The variable that holds the token (a flag value would show in `ps`).
@@ -697,6 +698,48 @@ pub fn started_line(bound: SocketAddr, with_peers: bool, logs: bool) -> String {
     }
 }
 
+/// The stats listener's limits (smaller in tests). The page is public, so
+/// nobody who can reach the port may hold connections open for long or take
+/// every place.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// Connections open at once.
+    connections: usize,
+    /// Connections open at once from one address.
+    connections_per_peer: usize,
+    /// How long after connecting the request's headers must be in.
+    headers_within: Duration,
+    /// How long a connection may stay open in all. Every answer closes its
+    /// connection, so this only matters to a client that reads slowly, such
+    /// as one fetching `/logs` (up to 256 KiB) a few bytes at a time.
+    lifetime: Duration,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { connections: 64, connections_per_peer: 8, headers_within: Duration::from_secs(5), lifetime: Duration::from_secs(30) }
+    }
+}
+
+/// Serve one connection: HTTP/1.1 only (no HTTP/2, which would carry many
+/// requests on one connection past the limits), one request, then closed.
+/// The places it holds are given back when it ends, however it ends.
+async fn serve_connection(tcp: tokio::net::TcpStream, app: Router, limits: Limits, _places: (OwnedSemaphorePermit, PeerSlot)) {
+    use hyper::service::Service as _;
+    let service = hyper_util::service::TowerToHyperService::new(app);
+    let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| service.call(request));
+    let served = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(limits.headers_within)
+        .keep_alive(false)
+        .serve_connection(hyper_util::rt::TokioIo::new(tcp), service);
+    match tokio::time::timeout(limits.lifetime, served).await {
+        Ok(Err(e)) => tracing::debug!("stats connection: {e}"),
+        Err(_) => tracing::debug!("stats connection: its time was up"),
+        Ok(Ok(())) => {}
+    }
+}
+
 /// Listen on `address`, and serve until the task is stopped. Fails now if
 /// the address can't be used, so rettui doesn't start without what was asked.
 /// With a `token`, a request that presents it also gets the peer list.
@@ -708,13 +751,39 @@ pub async fn serve(
     snapshot: Snapshot,
     log: Option<LogFiles>,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    serve_with(address, token, snapshot, log, Limits::default()).await
+}
+
+async fn serve_with(
+    address: &str,
+    token: Option<Token>,
+    snapshot: Snapshot,
+    log: Option<LogFiles>,
+    limits: Limits,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let address: SocketAddr =
         address.parse().with_context(|| format!("--stats-listen expects an address like 127.0.0.1:8741, not {address}"))?;
     let listener = tokio::net::TcpListener::bind(address).await.with_context(|| format!("could not listen for stats on {address}"))?;
     let bound = listener.local_addr()?;
     let app = router(snapshot, token, log);
+    let slots = Arc::new(Semaphore::new(limits.connections));
+    let peers = Arc::new(Peers::default());
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
+        loop {
+            let (tcp, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::debug!("stats accept: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            // Over a limit, it is closed at once, before anything is read.
+            let Some(peer_slot) = peers.take(peer_ip(peer.ip()), limits.connections_per_peer) else { continue };
+            let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
+            let _ = tcp.set_nodelay(true);
+            tokio::spawn(serve_connection(tcp, app.clone(), limits, (slot, peer_slot)));
+        }
     });
     Ok((bound, task))
 }
@@ -1239,6 +1308,109 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
         stream.write_all(b"GET /stats.json HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await.unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).await.unwrap();
+        assert!(text.starts_with("HTTP/1.1 200") && text.ends_with("{}"), "{text}");
+        task.abort();
+    }
+
+    /// Serves over TCP with short limits, for the limit tests.
+    async fn limited(limits: Limits) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let (_tx, rx) = channel(published("{}"));
+        serve_with("127.0.0.1:0", None, rx, None, limits).await.unwrap()
+    }
+
+    fn short() -> Limits {
+        Limits { headers_within: Duration::from_millis(300), lifetime: Duration::from_secs(5), ..Limits::default() }
+    }
+
+    /// Whether the server has closed `stream` (reads end or fail) within `within`.
+    async fn closed_within(stream: &mut tokio::net::TcpStream, within: Duration) -> bool {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 256];
+        tokio::time::timeout(within, async {
+            loop {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_half_sent_header_is_closed_at_the_deadline() {
+        use tokio::io::AsyncWriteExt;
+        let (bound, task) = limited(short()).await;
+        let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        stream.write_all(b"GET /stats.json HTTP/1.1\r\nHost: x\r\n").await.unwrap();
+        let started = Instant::now();
+        assert!(closed_within(&mut stream, Duration::from_secs(3)).await, "still open after 3 s");
+        assert!(started.elapsed() >= Duration::from_millis(250), "closed before the deadline: {:?}", started.elapsed());
+        // One that sends nothing at all is closed too.
+        let mut idle = tokio::net::TcpStream::connect(bound).await.unwrap();
+        assert!(closed_within(&mut idle, Duration::from_secs(3)).await, "an idle connection is still open after 3 s");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_connection_is_closed_when_its_lifetime_is_up() {
+        use tokio::io::AsyncWriteExt;
+        let (bound, task) =
+            limited(Limits { headers_within: Duration::from_secs(60), lifetime: Duration::from_millis(300), ..short() }).await;
+        let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        stream.write_all(b"GET /stats.json HTTP/1.1\r\n").await.unwrap();
+        assert!(closed_within(&mut stream, Duration::from_secs(3)).await, "still open after 3 s");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn connections_past_the_caps_are_closed_at_once_and_places_come_back() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (bound, task) = limited(Limits { connections_per_peer: 2, connections: 3, ..short() }).await;
+        // The per-address cap: two idle connections hold both places, the third is closed at once.
+        let mut first = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut second = tokio::net::TcpStream::connect(bound).await.unwrap();
+        let mut third = tokio::net::TcpStream::connect(bound).await.unwrap();
+        assert!(closed_within(&mut third, Duration::from_millis(250)).await, "a connection past the per-address cap stayed open");
+        assert!(!closed_within(&mut first, Duration::from_millis(50)).await);
+        assert!(!closed_within(&mut second, Duration::from_millis(50)).await);
+        // When the held ones are closed (at their deadline), the places are free again.
+        assert!(closed_within(&mut first, Duration::from_secs(3)).await);
+        assert!(closed_within(&mut second, Duration::from_secs(3)).await);
+        let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        stream.write_all(b"GET /stats.json HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut text = String::new();
+        stream.read_to_string(&mut text).await.unwrap();
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn connections_past_the_total_cap_are_closed_at_once() {
+        // Only one address is available here, so the total cap is tried with a per-address cap above it.
+        let (bound, task) = limited(Limits { connections: 2, connections_per_peer: 8, ..short() }).await;
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            held.push(tokio::net::TcpStream::connect(bound).await.unwrap());
+        }
+        let mut over = tokio::net::TcpStream::connect(bound).await.unwrap();
+        assert!(closed_within(&mut over, Duration::from_millis(250)).await, "a connection past the cap stayed open");
+        for stream in &mut held {
+            assert!(!closed_within(stream, Duration::from_millis(50)).await);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_normal_request_is_answered_and_closed_with_the_limits_on() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (bound, task) = limited(Limits::default()).await;
+        let mut stream = tokio::net::TcpStream::connect(bound).await.unwrap();
+        // No "Connection: close": the server closes after one answer by itself.
+        stream.write_all(b"GET /stats.json HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
         let mut text = String::new();
         stream.read_to_string(&mut text).await.unwrap();
         assert!(text.starts_with("HTTP/1.1 200") && text.ends_with("{}"), "{text}");

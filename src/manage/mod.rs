@@ -1270,7 +1270,7 @@ fn router_for(shared: Arc<Shared>) -> Router {
 
 /// An address, an IPv4 one written as IPv6 (`::ffff:a.b.c.d`) as IPv4, so it
 /// is checked (and a peer counted) the same either way.
-fn peer_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn peer_ip(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
         ip => ip,
@@ -1279,11 +1279,11 @@ fn peer_ip(ip: IpAddr) -> IpAddr {
 
 /// The connections open from each address.
 #[derive(Debug, Default)]
-struct Peers(Mutex<HashMap<IpAddr, usize>>);
+pub(crate) struct Peers(Mutex<HashMap<IpAddr, usize>>);
 
 impl Peers {
     /// A place for one more connection from `ip`, if it has fewer than `max` open.
-    fn take(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PeerSlot> {
+    pub(crate) fn take(self: &Arc<Self>, ip: IpAddr, max: usize) -> Option<PeerSlot> {
         let mut open = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         let count = open.get(&ip).copied().unwrap_or(0);
         if count >= max {
@@ -1300,7 +1300,7 @@ impl Peers {
 }
 
 /// One connection's place among its address's, given back when it closes.
-struct PeerSlot {
+pub(crate) struct PeerSlot {
     peers: Arc<Peers>,
     ip: IpAddr,
 }
