@@ -921,7 +921,7 @@ pub(crate) mod tests {
             ("created", Value::F64(1.5)),
             ("author", Value::from("ab".repeat(16))),
         ]);
-        let view = |signature: Vec<u8>| {
+        let view = |signature: Vec<u8>, signed_by: &str| {
             map(&[
                 ("id", Value::from(3)),
                 ("scope", Value::from("active")),
@@ -933,7 +933,7 @@ pub(crate) mod tests {
                         ("title", Value::from("Fix\x1b it")),
                         ("created", Value::F64(1.0)),
                         ("edited", Value::F64(2.0)),
-                        ("author", Value::from("cd".repeat(16))),
+                        ("author", Value::from(signed_by)),
                         ("identity", Value::Binary(author.get_public_key().to_vec())),
                         ("signature", Value::Binary(signature)),
                         ("format", Value::from("markdown")),
@@ -942,13 +942,18 @@ pub(crate) mod tests {
             ])
         };
         let request = GitRequest::WorkView { id: 3, scope: WorkScope::Active };
-        let (result, _) = ask(Canned::default().ok("/mgmt/work", "view", view(signature.to_vec())), request.clone());
+        let own = hex::encode(author.hash);
+        let (result, _) = ask(Canned::default().ok("/mgmt/work", "view", view(signature.to_vec(), &own)), request.clone());
         let GitReply::Doc(doc) = result.unwrap() else { panic!("not a document") };
         assert_eq!((doc.id, doc.title.as_str(), doc.text.as_str()), (3, "Fix it", "Body[31m with\nlines"));
         assert_eq!(doc.signer, Some(hex::encode(author.hash)));
         assert_eq!(doc.comments, [Comment { id: 1, author: "ab".repeat(16), created: 1.5, text: "A comment".into() }]);
         // A signature that doesn't match: no signer.
-        let (result, _) = ask(Canned::default().ok("/mgmt/work", "view", view(vec![0; 64])), request);
+        let (result, _) = ask(Canned::default().ok("/mgmt/work", "view", view(vec![0; 64], &own)), request.clone());
+        let GitReply::Doc(doc) = result.unwrap() else { panic!("not a document") };
+        assert_eq!(doc.signer, None);
+        // A good signature by a key that isn't the author's: no signer either.
+        let (result, _) = ask(Canned::default().ok("/mgmt/work", "view", view(signature.to_vec(), &"cd".repeat(16))), request);
         let GitReply::Doc(doc) = result.unwrap() else { panic!("not a document") };
         assert_eq!(doc.signer, None);
     }
