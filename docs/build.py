@@ -154,6 +154,8 @@ def write() -> None:
         title = "rettui" if page == HOME else titles.get(page, page.replace("-", " "))
         (PAGES / file_of(page)).write_text(convert(page, text, title, pages, problems))
     (PAGES / "CNAME").write_text("docs.rettui.dev\n")  # the site's own domain, for Pages
+    if (WIKI / "images").is_dir():  # screenshots, shown on the pages as images/<name>.png
+        shutil.copytree(WIKI / "images", PAGES / "images")
     if problems:
         sys.exit("The pages can't be built:\n  " + "\n  ".join(problems))
 

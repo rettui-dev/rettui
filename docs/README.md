@@ -17,6 +17,8 @@ python3 docs/build.py pages     # only write the pages and config
 - Links between pages (`[Running](Running#commands)`) point at their files,
   and `Home` becomes the front page.
 - Each page gets its name from the sidebar as its title.
+- The pictures in [wiki/images/](../wiki/images) are copied alongside, so a page
+  shows one as `![description](images/name.png)`.
 - GitHub's `> [!WARNING]` notes become admonitions.
 - The navigation is [wiki/_Sidebar.md](../wiki/_Sidebar.md), with
   [zensical.toml](zensical.toml)'s theme and settings.
