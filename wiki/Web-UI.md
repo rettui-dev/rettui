@@ -6,6 +6,11 @@ announces arrive. It prints a link to open:
 rettui web UI: http://127.0.0.1:8740/?token=…
 ```
 
+It comes in a light and a dark theme:
+
+![The web UI in its light theme, showing a conversation about a weather station](images/web-light.png)
+![The web UI in its dark theme, showing the same conversation](images/web-dark.png)
+
 - **Logging in:** the link logs that browser in with a cookie, and stays valid
   across restarts. Keep it private. Anyone with the link can read and send your
   messages as you. The login page also takes the token (the part after

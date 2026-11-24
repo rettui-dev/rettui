@@ -4,6 +4,12 @@ narrower than 110 columns get a sidebar of icons and narrower side lists, so
 80×24 works well. Below 40×10 there's no room for the tabs, and the screen
 asks for a bigger terminal instead.
 
+![The terminal UI's Messages tab: the conversation list on the left and a conversation about a weather station on the right](images/tui-messages.png)
+
+The Network tab lists the peers that have announced themselves:
+
+![The terminal UI's Network tab, listing two peers heard on the network with their addresses, hops and the interface they came in on](images/tui-network.png)
+
 **Colours, times and dates** are settings (Status): *Terminal colours* is
 dark (for a dark terminal, the default), light (for a light one) or basic
 (16 colours, for a terminal without full colour); *Clock* is 24-hour or

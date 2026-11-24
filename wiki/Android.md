@@ -2,6 +2,9 @@ An Android app is being built: rettui itself, with its whole Reticulum
 stack, running on the phone, and its [web UI](Web-UI) as the app's screen.
 It's an early test version.
 
+![The Android app's Node screen: the node is off, with its address, its folder and its pages listed](images/android-node.png)
+![The Android app's Reticulum screen: the config file, its sections and the interfaces](images/android-reticulum.png)
+
 ## Getting it
 
 From a [release](https://github.com/rettui-dev/rettui/releases) (from v1.10.0
