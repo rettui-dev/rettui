@@ -2,8 +2,11 @@ An Android app is being built: rettui itself, with its whole Reticulum
 stack, running on the phone, and its [web UI](Web-UI) as the app's screen.
 It's an early test version.
 
-![The Android app's Node screen: the node is off, with its address, its folder and its pages listed](images/android-node.png)
-![The Android app's Reticulum screen: the config file, its sections and the interfaces](images/android-reticulum.png)
+![The Android app showing a conversation with a message from a contact](images/android-conversation.png)
+![The Android app's Network tab, listing the peers it has heard](images/android-network.png)
+![The Android app in an RRC chat room](images/android-channel.png)
+![The Android app showing a NomadNet page](images/android-browser.png)
+![The Android app showing a chess game](images/android-game.png)
 
 ## Getting it
 
