@@ -35,7 +35,8 @@ of the Reticulum instance it uses. Where files are kept is in
   identity key, see [Repos](Repos#who-you-are-to-a-node)), and it can turn
   "Run page scripts" and "Receive files with rncp" off but not on (and
   "Disconnect Bootstrap only interfaces" too, which lets entry points found
-  take the place of yours). These decide
+  take the place of yours, and "Name interfaces on the stats page", which
+  makes their names public). These decide
   what runs on the computer rettui runs on (a config's pipe interfaces run
   commands, and scripts are programs), and the web login must not be able to
   run programs there. Change them in the terminal UI, or in `settings.json`

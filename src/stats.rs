@@ -399,9 +399,59 @@ fn announce_queue_object(interfaces: &[crate::net::InterfaceInfo]) -> (Option<u6
     (Some(queued), object)
 }
 
+/// The most rows `interfaces.list` has.
+const INTERFACE_ROWS_MAX: usize = 32;
+
+/// The name an operator gave an interface, as the stats page lists it. Reticulum
+/// names an interface `Type[name/host:port]`, so the type and the address are
+/// cut off, and what is left has no control or invisible characters and at most
+/// [`NAME_MAX`] characters. `(unnamed)` if nothing is left.
+fn interface_label(raw: &str) -> String {
+    let inner = match (raw.find('['), raw.rfind(']')) {
+        (Some(open), Some(close)) if open < close && close + 1 == raw.len() => &raw[open + 1..close],
+        _ => raw,
+    };
+    // The address is what follows the last slash, when that ends in a port.
+    let name = match inner.rsplit_once('/') {
+        Some((name, address))
+            if address.rsplit_once(':').is_some_and(|(_, port)| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            name
+        }
+        _ => inner,
+    };
+    let name: String = name.chars().filter(|c| !crate::config::unsafe_in_text(*c)).take(NAME_MAX).collect();
+    let name = name.trim();
+    if name.is_empty() { "(unnamed)".into() } else { name.to_string() }
+}
+
+/// The `interfaces.list` rows, for the interfaces the settings choose: name,
+/// whether it is up and its bytes, and nothing else. At most
+/// [`INTERFACE_ROWS_MAX`]; and whether some were left out.
+fn interface_rows(app: &App) -> (Vec<Value>, bool) {
+    let chosen: Option<Vec<String>> = app
+        .settings
+        .stats_interface_names
+        .as_deref()
+        .map(|list| list.split(',').map(|name| name.trim().to_string()).filter(|name| !name.is_empty()).collect());
+    let mut rows = Vec::new();
+    for interface in &app.interfaces {
+        let name = interface_label(&interface.name);
+        if chosen.as_ref().is_some_and(|names| !names.contains(&name)) {
+            continue;
+        }
+        if rows.len() == INTERFACE_ROWS_MAX {
+            return (rows, true);
+        }
+        rows.push(json!({ "name": name, "online": interface.online, "rx_bytes": interface.rx_bytes, "tx_bytes": interface.tx_bytes }));
+    }
+    (rows, false)
+}
+
 /// The JSON for `app`, as of now. Totals only: no addresses, hashes, or names
-/// of peers, interfaces or clients, and no row per interface or client. With
-/// `with_peers` (a token is set), the authorised answer is made too. `disk`
+/// of peers, interfaces or clients, and no row per client. Only if the
+/// settings ask (`stats_interfaces`), a row per interface with its name, state
+/// and bytes, in `interfaces.list`. With `with_peers` (a token is set), the authorised answer is made too. `disk`
 /// supplies the disk object once it has a first measurement; only the authorised
 /// answer has the file system's size and free space.
 pub fn snapshot(app: &App, started: Instant, with_peers: bool, disk: &Disk) -> Arc<Published> {
@@ -443,6 +493,15 @@ pub fn snapshot(app: &App, started: Instant, with_peers: bool, disk: &Disk) -> A
         "announces_last_minute": app.announce_log.last_minute(),
     });
     let usage = disk.current(&app.paths.root);
+    if app.settings.stats_interfaces
+        && let Some(interfaces) = json.get_mut("interfaces").and_then(Value::as_object_mut)
+    {
+        let (rows, truncated) = interface_rows(app);
+        interfaces.insert("list".into(), Value::Array(rows));
+        if truncated {
+            interfaces.insert("list_truncated".into(), Value::Bool(true));
+        }
+    }
     if let Some(map) = json.as_object_mut() {
         if let Some(pn) = propagation_object(app) {
             map.insert("propagation".into(), pn);
@@ -851,7 +910,11 @@ mod tests {
         assert_eq!(json["interfaces"]["tx_bytes"], 22);
         let interfaces = json["interfaces"].as_object().unwrap();
         let keys: Vec<_> = interfaces.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["announce_queue", "clients", "online", "rx_bytes", "total", "tx_bytes"], "no per-interface rows");
+        assert_eq!(
+            keys,
+            ["announce_queue", "clients", "online", "rx_bytes", "total", "tx_bytes"],
+            "no per-interface rows unless the setting is on"
+        );
         assert_eq!(json["peers_heard"], json!({ "total": 4, "lxmf": 2, "nomad": 1, "propagation": 1 }));
         assert_eq!(json["announces_last_minute"], 0);
         let text = json.to_string();
@@ -872,6 +935,110 @@ mod tests {
         assert_eq!(json["interfaces"]["online"], 40);
         assert!(json["interfaces"].get("list").is_none(), "{json}");
         assert!(!json.to_string().contains("i39"), "{json}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn public_json(app: &App) -> Value {
+        serde_json::from_str(&snapshot(app, Instant::now(), false, &Disk::default()).public).unwrap()
+    }
+
+    #[test]
+    fn interface_rows_are_off_by_default_and_listed_when_asked() {
+        let (mut app, dir) = app("rows");
+        assert!(!app.settings.stats_interfaces);
+        assert!(public_json(&app)["interfaces"].get("list").is_none());
+        app.settings.stats_interfaces = true;
+        let json = public_json(&app);
+        assert_eq!(
+            json["interfaces"]["list"],
+            json!([
+                { "name": "Public entry point", "online": true, "rx_bytes": 10, "tx_bytes": 20 },
+                { "name": "Uplink", "online": false, "rx_bytes": 1, "tx_bytes": 2 },
+                { "name": "Second server", "online": true, "rx_bytes": 0, "tx_bytes": 0 },
+            ])
+        );
+        assert!(json["interfaces"].get("list_truncated").is_none());
+        // The token's answer has them too.
+        let authorised: Value =
+            serde_json::from_str(snapshot(&app, Instant::now(), true, &Disk::default()).authorised.as_deref().unwrap()).unwrap();
+        assert_eq!(authorised["interfaces"]["list"], json["interfaces"]["list"]);
+        // Choosing names lists those only, in the order Reticulum has them.
+        app.settings.stats_interface_names = Some(" Uplink , Public entry point,, nothing ".into());
+        let names: Vec<_> = public_json(&app)["interfaces"]["list"].as_array().unwrap().iter().map(|r| r["name"].clone()).collect();
+        assert_eq!(names, [json!("Public entry point"), json!("Uplink")]);
+        // The totals still count every interface.
+        assert_eq!(public_json(&app)["interfaces"]["total"], 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interface_rows_hold_a_name_and_numbers_and_no_address() {
+        let (mut app, dir) = app("rows-address");
+        app.settings.stats_interfaces = true;
+        app.interfaces = vec![
+            InterfaceInfo {
+                name: "TCPInterface[Beleth/rns.beleth.net:4242]".into(),
+                online: true,
+                clients: Some(9),
+                mode: "gateway".into(),
+                bitrate: 5,
+                ..Default::default()
+            },
+            InterfaceInfo { name: "BackboneInterface[Golden Backbone/[fd00::1]:4243]".into(), ..Default::default() },
+            InterfaceInfo { name: "TCPInterface[MichMesh]".into(), ..Default::default() },
+            InterfaceInfo { name: "SerialInterface[Radio/1]".into(), ..Default::default() },
+        ];
+        let json = public_json(&app);
+        let rows = json["interfaces"]["list"].as_array().unwrap();
+        let names: Vec<_> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Beleth", "Golden Backbone", "MichMesh", "Radio/1"]);
+        for row in rows {
+            let keys: Vec<_> = row.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(keys, ["name", "online", "rx_bytes", "tx_bytes"]);
+        }
+        let text = json.to_string();
+        for secret in ["beleth.net", "4242", "4243", "fd00", "gateway", "TCPInterface", "BackboneInterface"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interface_labels_are_cleaned_and_cut() {
+        assert_eq!(interface_label("Plain name"), "Plain name");
+        assert_eq!(interface_label("  A\u{1b}[31mB\r\n\u{202e}C\u{200b}D  "), "A[31mBCD");
+        assert_eq!(interface_label(&"x".repeat(500)).chars().count(), NAME_MAX);
+        assert_eq!(interface_label(&"é".repeat(500)).chars().count(), NAME_MAX);
+        for empty in ["", "   ", "\u{7}\u{200b}", "TCPInterface[]", "TCPInterface[ /127.0.0.1:1]"] {
+            assert_eq!(interface_label(empty), "(unnamed)", "{empty:?}");
+        }
+        // Odd brackets and slashes don't panic or cut a character in two.
+        for odd in ["]a[", "[", "]", "[é]", "é[é/é:1]é", "/", ":", "a/:", "a/b:c", "x[y/z:80]]"] {
+            let _ = interface_label(odd);
+        }
+        assert_eq!(interface_label("TCPInterface[a/b:80]"), "a");
+        assert_eq!(interface_label("TCPInterface[a/b:]"), "a/b:");
+    }
+
+    #[test]
+    fn interface_rows_stop_at_the_cap_and_say_so() {
+        let (mut app, dir) = app("rows-cap");
+        app.settings.stats_interfaces = true;
+        app.interfaces = (0..INTERFACE_ROWS_MAX).map(|i| InterfaceInfo { name: format!("i{i}"), ..Default::default() }).collect();
+        let json = public_json(&app);
+        assert_eq!(json["interfaces"]["list"].as_array().unwrap().len(), INTERFACE_ROWS_MAX);
+        assert!(json["interfaces"].get("list_truncated").is_none(), "exactly the cap is not cut");
+        app.interfaces.extend((0..8).map(|i| InterfaceInfo { name: format!("extra{i}"), ..Default::default() }));
+        let json = public_json(&app);
+        assert_eq!(json["interfaces"]["list"].as_array().unwrap().len(), INTERFACE_ROWS_MAX);
+        assert_eq!(json["interfaces"]["list_truncated"], true);
+        assert_eq!(json["interfaces"]["total"], INTERFACE_ROWS_MAX + 8);
+        assert!(!json.to_string().contains("extra0"));
+        // A choice that matches nothing gives an empty list.
+        app.settings.stats_interface_names = Some("nothing like it".into());
+        let json = public_json(&app);
+        assert_eq!(json["interfaces"]["list"], json!([]));
+        assert!(json["interfaces"].get("list_truncated").is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

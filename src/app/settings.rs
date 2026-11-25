@@ -430,6 +430,7 @@ impl App {
 fn turn_off_only_reason(key: &str) -> &'static str {
     match key {
         "disconnect_bootstrap_only" => "it lets interfaces found on the network replace the ones you chose",
+        "stats_interfaces" => "it makes the names of your interfaces public",
         _ => "it runs programs on this computer",
     }
 }
@@ -501,6 +502,7 @@ mod tests {
                     "telemetry_collector" => address.clone(),
                     "telemetry_mqtt" => "mqtt://broker.local".into(),
                     "pn_static_peers" => address.clone(),
+                    "stats_interface_names" => "Uplink, Second server".into(),
                     "location" => "1.5, 2.5".into(),
                     "map_tiles" => String::new(),
                     "map_tiles_file" => offline_map.clone(),

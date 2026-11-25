@@ -219,7 +219,8 @@ A public node can show a few numbers on a status page. `--stats-listen
 ADDRESS` (with `--web`, or after `rettui node`) serves a read-only summary at
 `/stats.json` on its own address, with no login. It is off unless you give it, and it publishes
 totals only: no addresses, no names of peers or interfaces, no clients' addresses, and no row for
-each interface or client. It can't change anything and has no way into the web UI.
+each interface or client, unless you turn on
+[named interfaces](Hosting-a-Node#named-interfaces). It can't change anything and has no way into the web UI.
 
 ```sh
 rettui --web 127.0.0.1:8740 --stats-listen 127.0.0.1:8741

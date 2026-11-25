@@ -372,7 +372,8 @@ Things to know:
 With `--stats-listen ADDRESS` the node also serves a read-only summary of
 itself at `/stats.json` on that address, with no login. It is off unless you
 give it, and it publishes totals only: no addresses, no names of peers or
-interfaces, no clients' addresses, and no row for each interface or client.
+interfaces, no clients' addresses, and no row for each interface or client
+(unless you turn on [named interfaces](#named-interfaces), below).
 It can't change anything. The numbers are updated every second.
 
     rettui --data-dir /var/lib/rettui-node node --stats-listen 127.0.0.1:8741
@@ -465,6 +466,41 @@ with none of their names:
 - If no interface reports a queue (none are up yet), `queued`, `limit`,
   `full`, `fullest` and `interfaces_full` are `null` and `interface_limit` is
   still there.
+
+### Named interfaces
+
+A status page that shows each upstream (say MichMesh, Beleth or Ratspeak) as
+online or offline needs a row for each interface. Names are not public by
+default, so this is off until you turn on *Name interfaces on the stats page*
+(`stats_interfaces`) in Settings, in the terminal UI (the web UI can turn it
+off, not on). `interfaces` then also has `list`, in the order Reticulum has the
+interfaces, in the answer for everyone and the one for the token alike:
+
+```json
+"interfaces": {
+  "total": 3, "online": 2, "clients": 17, "rx_bytes": 123, "tx_bytes": 456, "announce_queue": 5,
+  "list": [
+    { "name": "MichMesh", "online": true, "rx_bytes": 100, "tx_bytes": 200 },
+    { "name": "Beleth", "online": false, "rx_bytes": 20, "tx_bytes": 30 }
+  ]
+}
+```
+
+Each row has these four fields and nothing else: no address, host, port,
+mode, client or announce number. `name` is the name from the Reticulum config
+(`[[MichMesh]]`), not Reticulum's longer `TCPInterface[MichMesh/host:4242]`:
+the type and the address after the last `/` are cut off, control and invisible
+characters are removed, and it is cut at 64 characters (`(unnamed)` if nothing
+is left). Two interfaces can have the same name. `rx_bytes` and `tx_bytes` are
+since Reticulum started. There are at most 32 rows; if there were more,
+`interfaces.list_truncated` is `true`. The totals above still count every
+interface. `version` stays 1, as keys are only added.
+
+*Interfaces on the stats page* (`stats_interface_names`) picks which ones are
+listed: their names as the page gives them, separated by commas (a name can't
+hold a comma), such as `MichMesh, Beleth`. Empty lists all of them, so a node
+that must not name its private links should list the public ones only. Names
+that match nothing give an empty `list`.
 
 `interfaces.clients` adds up the clients connected to the node's server
 interfaces (`null` when none report any). The other fields, and how the

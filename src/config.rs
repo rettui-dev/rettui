@@ -269,6 +269,13 @@ pub struct Settings {
     /// when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rncp_dir: Option<String>,
+    /// List each interface's name, whether it is up and its bytes in the
+    /// stats page's `interfaces.list` (names are not public otherwise).
+    pub stats_interfaces: bool,
+    /// Which interfaces that list has: their names, separated by commas;
+    /// all of them when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats_interface_names: Option<String>,
     /// Host an RRC hub (rsRRCD's, in `rrc-hub/`).
     pub hub_enabled: bool,
     /// Name the hub announces and welcomes people with; the display name
@@ -384,6 +391,8 @@ impl Default for Settings {
             rncp_listen: false,
             rncp_allowed: None,
             rncp_dir: None,
+            stats_interfaces: false,
+            stats_interface_names: None,
             hub_enabled: false,
             hub_name: None,
             hub_greeting: None,
@@ -857,6 +866,8 @@ impl Field {
             // Which folder is served.
             "git_host_dir" => WebAccess::TerminalOnly,
             "node_executable_pages" | "rncp_listen" => WebAccess::TurnOffOnly,
+            // Turning it on makes interface names public.
+            "stats_interfaces" => WebAccess::TurnOffOnly,
             // Turning it on lets announced entry points replace the ones
             // chosen: the web login may only put the safer way back.
             "disconnect_bootstrap_only" => WebAccess::TurnOffOnly,
@@ -1038,6 +1049,8 @@ const SECTIONS: &[(Section, &[&str])] = &[
             "rncp_listen",
             "rncp_allowed",
             "rncp_dir",
+            "stats_interfaces",
+            "stats_interface_names",
             "hub_open_rooms",
         ],
     ),
@@ -1604,6 +1617,20 @@ pub const FIELDS: &[Field] = &[
         effect: Effect::Now,
     },
     Field {
+        key: "stats_interfaces",
+        label: "Name interfaces on the stats page",
+        help: "List each interface by name on the stats page (/stats.json) with whether it is up and its bytes sent and received, for a status page. Names are not public otherwise; no address or port ever is. The web UI can turn it off, not on",
+        kind: FieldKind::Toggle,
+        effect: Effect::Now,
+    },
+    Field {
+        key: "stats_interface_names",
+        label: "Interfaces on the stats page",
+        help: "Which interfaces that list has: their names as the stats page would give them (the name in the Reticulum config), separated by commas. Empty lists all of them (32 at most)",
+        kind: FieldKind::Optional,
+        effect: Effect::Now,
+    },
+    Field {
         key: "tui_theme",
         label: "Terminal colours",
         help: "The terminal UI's colours: dark (for a dark terminal), light (for a light one), or basic (16 colours, for terminals without full colour). The web UI picks its own, in its Status page",
@@ -1742,6 +1769,8 @@ pub const FIELDS: &[Field] = &[
 const MAX_DISCOVERED_ENTRY_POINTS: u64 = 16;
 /// Longest display name accepted.
 pub const MAX_DISPLAY_NAME: usize = 128;
+/// The longest list of interface names for the stats page.
+const MAX_STATS_INTERFACE_NAMES: usize = 1024;
 /// Upper bounds for numbers (a year), so durations cannot overflow.
 const MAX_MINUTES: u64 = 525_600;
 /// How often the LXMF address may be announced on its own, in minutes:
@@ -1970,6 +1999,8 @@ impl Settings {
             "rncp_listen" => self.rncp_listen.to_string(),
             "rncp_allowed" => self.rncp_allowed.clone().unwrap_or_default(),
             "rncp_dir" => self.rncp_dir.clone().unwrap_or_default(),
+            "stats_interfaces" => self.stats_interfaces.to_string(),
+            "stats_interface_names" => self.stats_interface_names.clone().unwrap_or_default(),
             "git_host_push_mb" => self.git_host_push_mb.to_string(),
             "git_host_repo_mb" => self.git_host_repo_mb.to_string(),
             "git_host_prune" => self.git_host_prune.to_string(),
@@ -2169,6 +2200,18 @@ impl Settings {
                     return Err(fail(format!("no such parent directory for {text}")));
                 }
                 self.rncp_dir = optional(value);
+            }
+            "stats_interfaces" => self.stats_interfaces = toggle(value).map_err(fail)?,
+            "stats_interface_names" => {
+                if let Some(text) = optional(value) {
+                    if text.chars().count() > MAX_STATS_INTERFACE_NAMES {
+                        return Err(fail(format!("at most {MAX_STATS_INTERFACE_NAMES} characters")));
+                    }
+                    if text.chars().any(unsafe_in_text) {
+                        return Err(fail("no control or invisible characters".into()));
+                    }
+                }
+                self.stats_interface_names = optional(value);
             }
             "git_host_name" => {
                 if optional(value).is_some_and(|n| n.chars().count() > MAX_DISPLAY_NAME) {
@@ -2751,6 +2794,27 @@ mod tests {
         // The web login may turn it off, not on (it would let found entry
         // points take the place of the user's); it starts with the next start.
         assert_eq!((field.web_access(), field.effect), (WebAccess::TurnOffOnly, Effect::NextStart));
+    }
+
+    #[test]
+    fn the_stats_interface_settings_start_off_and_are_checked() {
+        let mut s = Settings::default();
+        assert!(!s.stats_interfaces && s.stats_interface_names.is_none(), "names are not public unless asked");
+        s.set_field("stats_interfaces", "on").unwrap();
+        assert_eq!(s.field_value("stats_interfaces"), "true");
+        assert!(s.set_field("stats_interfaces", "maybe").is_err());
+        s.set_field("stats_interface_names", " MichMesh, Beleth ").unwrap();
+        assert_eq!(s.field_value("stats_interface_names"), "MichMesh, Beleth");
+        assert!(s.set_field("stats_interface_names", "a\nb").is_err());
+        assert!(s.set_field("stats_interface_names", &"x".repeat(1025)).is_err());
+        s.set_field("stats_interface_names", "").unwrap();
+        assert!(s.stats_interface_names.is_none());
+        // Older settings files have neither; the file stays small while they are unset.
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!old.stats_interfaces);
+        assert!(serde_json::to_value(&old).unwrap().get("stats_interface_names").is_none());
+        let field = FIELDS.iter().find(|f| f.key == "stats_interfaces").unwrap();
+        assert_eq!((field.web_access(), field.effect), (WebAccess::TurnOffOnly, Effect::Now));
     }
 
     #[test]
