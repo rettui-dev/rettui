@@ -9,9 +9,15 @@
 
 services:
   rettui:
-    # To use a release image instead of building one, remove `build: .` and
+    # To use a release image instead of building one, remove `build:` and
     # set `image: ghcr.io/rettui-dev/rettui:latest`.
-    build: .
+    build:
+      context: .
+      # The commit shown on the Status page; there is no .git in the build.
+      # RETTUI_COMMIT=$(git rev-parse HEAD) docker compose build
+      args:
+        RETTUI_COMMIT: ${RETTUI_COMMIT:-}
+        RETTUI_TAG: ${RETTUI_TAG:-}
     image: rettui:latest
     container_name: rettui
     restart: unless-stopped

@@ -42,6 +42,9 @@ The workflows are in [.github/workflows](https://github.com/rettui-dev/rettui/tr
   - Run it from *Actions > Build > Run workflow* (tick *Linux only* for
     just the Linux binaries).
   - Download the archives from the run's *Artifacts*.
+  - They know the commit they were built from (`build.rs`; set `RETTUI_COMMIT`
+    and `RETTUI_TAG` where there is no `.git`, as in the Docker build) and the
+    Status page links it.
   - They're named after the version and commit, for example
     `rettui-v1.2.0-a4e545b-x86_64-unknown-linux-gnu.tar.gz`.
 - **Desktop** ([desktop.yml](https://github.com/rettui-dev/rettui/blob/main/.github/workflows/desktop.yml)) builds

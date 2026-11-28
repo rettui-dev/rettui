@@ -2593,3 +2593,19 @@ async fn a_downloaded_file_is_sent_from_disk_and_kept_only_until_the_next() {
     assert_eq!(web.get(&format!("/api/download?url={NODE}:/file/disk/notes.txt")).await.body, b"notes");
     assert_eq!(fetches(&web), 0);
 }
+
+#[tokio::test]
+async fn the_state_names_the_commit_this_build_was_made_from() {
+    let web = TestWeb::start("build-commit");
+    let state = web.get("/api/state").await.json();
+    let build = crate::build_info::current();
+    let commit = &state["version"]["commit"];
+    assert_eq!(commit["short"], build.short());
+    assert_eq!(commit["commit"].as_str(), build.commit());
+    assert_eq!(commit["url"].as_str().map(String::from), build.url());
+    assert_eq!(commit["release"], build.is_release());
+    // A link is only ever to this project, never made from the unknown.
+    if let Some(url) = commit["url"].as_str() {
+        assert!(url.starts_with("https://github.com/rettui-dev/rettui/"), "{url}");
+    }
+}

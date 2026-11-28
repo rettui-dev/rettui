@@ -21,6 +21,11 @@ COPY vendor ./vendor
 COPY src ./src
 # The desktop app is in the same workspace (only its manifest is read).
 COPY desktop ./desktop
+# The commit this image is built from, for the Status page (there is no .git
+# here; build.rs reads these). Empty means unknown.
+ARG RETTUI_COMMIT=
+ARG RETTUI_TAG=
+ENV RETTUI_COMMIT=${RETTUI_COMMIT} RETTUI_TAG=${RETTUI_TAG}
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     test -f deps/rsReticulum/Cargo.toml \

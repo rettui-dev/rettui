@@ -383,6 +383,8 @@ It can't change anything. The numbers are updated every second.
 {
   "version": 1,
   "rettui_version": "2.1.0",
+  "rettui_commit": "0123456789abcdef0123456789abcdef01234567",
+  "rettui_release": true,
   "generated_at": 1763528000,
   "uptime_seconds": 12345,
   "interfaces": {

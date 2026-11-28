@@ -10,6 +10,7 @@
 mod android;
 mod app;
 mod backup;
+mod build_info;
 mod cli;
 mod clock;
 mod config;

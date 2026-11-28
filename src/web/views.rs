@@ -114,6 +114,8 @@ pub fn state(app: &App) -> Value {
         "version": {
             "current": crate::update::VERSION,
             "build": crate::update::install::build_label(),
+            // The commit it was made from, and its link.
+            "commit": crate::build_info::current().json(),
             "status": app.version_status(),
             "checking": app.updates.checking(),
             "error": app.updates.error.is_some(),

@@ -2050,6 +2050,15 @@ fn every_user_menu_action_by_key_and_click() {
 }
 
 #[test]
+fn the_status_tab_shows_the_commit_beside_the_version() {
+    let mut tui = Tui::new("status-build");
+    let screen = tui.tab(Tab::Status).resize(120, 40);
+    let build = crate::build_info::current();
+    let row = screen.lines().find(|l| l.contains("Version")).expect("a Version row");
+    assert!(row.contains(&format!("· {}", build.short())), "{row}");
+}
+
+#[test]
 fn the_status_tab_in_every_state() {
     use crate::app::node::NodeStatus;
     use crate::app::{NetState, SyncState};

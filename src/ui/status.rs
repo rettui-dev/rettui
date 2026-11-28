@@ -362,6 +362,8 @@ fn version_line(app: &App, label: Span<'static>) -> Line<'static> {
         label,
         Span::raw(crate::update::VERSION).bold(),
         Span::styled(format!(" ({})", crate::update::install::build_label()), Style::default().fg(dim())),
+        // The commit it was made from (the web UI links it).
+        Span::styled(format!(" · {}", crate::build_info::current().short()), Style::default().fg(dim())),
         Span::styled(format!("  {status}"), Style::default().fg(color)),
     ];
     if !app.updates.checking() {

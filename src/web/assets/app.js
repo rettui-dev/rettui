@@ -8365,6 +8365,11 @@ app.views.status = {
         s.lxmf_address ? el('button', { text: 'Copy', title: 'Your address with your key (lxma://), so whoever you give it to can write to you at once',
           onclick: () => copy(s.identity_link || s.lxmf_address, s.identity_link ? 'your LXMF address, with your key' : 'your LXMF address') }) : null,
         s.identity_link ? el('button', { text: 'QR code', title: 'Your address as a QR code, to be added as a contact', onclick: () => showAddress(s.identity_link) }) : null),
+      label('Build'), el('div', { class: 'row' }, s.version.commit.url
+        ? el('a', { class: 'mono', href: s.version.commit.url, target: '_blank', rel: 'noopener noreferrer', text: s.version.commit.short,
+          title: s.version.commit.release ? 'This build is a release: its page on GitHub' : 'The commit this build was made from, on GitHub' })
+        : el('span', { class: 'mono', text: s.version.commit.short, title: s.version.commit.dirty ? 'Built with changes that no commit has' : 'Which commit this was built from isn\'t known' }),
+        s.version.commit.release ? el('span', { class: 'dim', text: 'release' }) : null),
       label('Version'), el('div', { class: 'row' },
         el('span', {}, el('strong', { text: s.version.current }), el('span', { class: 'dim', text: ` (${s.version.build})` })),
         el('span', { class: s.version.error ? 'state-bad' : s.version.newer ? 'update-note' : 'dim', text: s.version.status }),

@@ -1,6 +1,6 @@
 The web UI can run in a container. Each release publishes an image for
 x86-64 and ARM64 to `ghcr.io/rettui-dev/rettui`, tagged with the version (`1.2.0`,
-`1.2`, `1`) and `latest`. To use it, remove `build: .` from
+`1.2`, `1`) and `latest`. To use it, remove the `build:` section from
 [compose.yaml](https://github.com/rettui-dev/rettui/blob/main/compose.yaml) and set `image: ghcr.io/rettui-dev/rettui:latest`,
 then `docker compose up -d`. Every other branch has an image too, named
 after the branch (`ghcr.io/rettui-dev/rettui:dev` for `dev`); see
@@ -13,6 +13,11 @@ git submodule update --init
 docker compose up -d --build
 docker compose logs rettui   # the login link (http://127.0.0.1:8740/?token=…)
 ```
+
+The image has no `.git` folder, so the commit shown on the Status page comes
+from the build arguments `RETTUI_COMMIT` and `RETTUI_TAG`. Compose passes them
+on from your environment (`RETTUI_COMMIT=$(git rev-parse HEAD) docker compose
+up -d --build`); without them the Status page says `unknown`.
 
 - **Data:** [compose.yaml](https://github.com/rettui-dev/rettui/blob/main/compose.yaml) keeps everything in `./data`
   next to it: the identity, settings, messages, cache, and the Reticulum

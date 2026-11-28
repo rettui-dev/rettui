@@ -78,6 +78,15 @@ check), and a newer one found this way shows as above, ready to install.
 With *Check for updates* off and nothing checked by hand since rettui
 started, *Version* says so rather than show an older check's answer.
 
+*Version* also gives the first 7 characters of the commit the running build
+was made from. In the web UI's Status page, *Build* shows it as a link to
+that commit on GitHub, or, when the build is exactly a tagged release, to the
+release's page. A build made with changes that no commit has shows
+`<hash>-dirty`, and one made without git (a source archive) shows `unknown`;
+neither has a link. If you build without a `.git` folder, set `RETTUI_COMMIT`
+(the full hash) and, for a release, `RETTUI_TAG` (such as `v2.1.0`) when you
+run `cargo build`.
+
 Checks count releases only. To be offered prereleases too (release
 candidates and development builds, which may be rough), turn on
 *Include prereleases in update checks* (Status, `update_prereleases`):

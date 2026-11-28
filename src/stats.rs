@@ -478,6 +478,8 @@ pub fn snapshot(app: &App, started: Instant, with_peers: bool, disk: &Disk) -> A
     let mut json = json!({
         "version": 1,
         "rettui_version": env!("CARGO_PKG_VERSION"),
+        "rettui_commit": crate::build_info::current().commit(),
+        "rettui_release": crate::build_info::current().is_release(),
         "generated_at": generated_at,
         "uptime_seconds": started.elapsed().as_secs(),
         "interfaces": {
@@ -901,6 +903,10 @@ mod tests {
         let json: Value = serde_json::from_str(&snapshot(&app, Instant::now(), false, &Disk::default()).public).unwrap();
         assert_eq!(json["version"], 1);
         assert_eq!(json["rettui_version"], env!("CARGO_PKG_VERSION"));
+        // The commit is the build's: a full hash, or null when it isn't known.
+        let commit = crate::build_info::current();
+        assert_eq!(json["rettui_commit"].as_str(), commit.commit());
+        assert_eq!(json["rettui_release"], commit.is_release());
         assert!(json["generated_at"].as_u64().unwrap() > 1_700_000_000);
         assert_eq!(json["uptime_seconds"], 0);
         assert_eq!(json["interfaces"]["total"], 3);
@@ -921,7 +927,7 @@ mod tests {
         assert!(!text.contains("Secret Name") && !text.contains("0000000000000000000000000000000"), "{text}");
         assert!(!text.contains("Public entry point") && !text.contains("Uplink") && !text.contains("Second server"), "{text}");
         let keys: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys.len(), 8, "{keys:?}");
+        assert_eq!(keys.len(), 10, "{keys:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1379,7 +1385,7 @@ mod tests {
         assert_eq!(keys, ["data_bytes"], "the file system's size is not public");
         assert!(!snapshot(&app, Instant::now(), true, &disk).public.contains("fs_"));
         assert_eq!(value["version"], 1);
-        assert_eq!(value.as_object().unwrap().len(), 9);
+        assert_eq!(value.as_object().unwrap().len(), 11);
         // On failure the fields are null.
         let failed = Disk::default();
         let gone = dir.join("missing");
@@ -1741,7 +1747,7 @@ mod tests {
         assert_eq!(head[header::CACHE_CONTROL], "no-store");
         assert_eq!(head.get(header::VARY).is_some(), vary, "Vary is sent when a token is set, on both answers");
         assert!(json.get("peers").is_none() && json.get("authorised").is_none() && json.get("peers_truncated").is_none(), "{json}");
-        assert_eq!(json.as_object().unwrap().len(), 8);
+        assert_eq!(json.as_object().unwrap().len(), 10);
         assert!(!json.to_string().contains("Secret Name"));
     }
 
